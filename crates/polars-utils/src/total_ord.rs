@@ -8,6 +8,7 @@ use crate::nulls::IsNull;
 
 /// Converts an f32 into a canonical form, where -0 == 0 and all NaNs map to
 /// the same value.
+#[inline]
 pub fn canonical_f32(x: f32) -> f32 {
     // -0.0 + 0.0 becomes 0.0.
     let convert_zero = x + 0.0;
@@ -20,6 +21,7 @@ pub fn canonical_f32(x: f32) -> f32 {
 
 /// Converts an f64 into a canonical form, where -0 == 0 and all NaNs map to
 /// the same value.
+#[inline]
 pub fn canonical_f64(x: f64) -> f64 {
     // -0.0 + 0.0 becomes 0.0.
     let convert_zero = x + 0.0;
@@ -451,7 +453,7 @@ impl<T: TotalOrd, U: TotalOrd> TotalOrd for (T, U) {
     }
 }
 
-impl<'a> TotalHash for BytesHash<'a> {
+impl TotalHash for BytesHash<'_> {
     #[inline(always)]
     fn tot_hash<H>(&self, state: &mut H)
     where
@@ -461,7 +463,7 @@ impl<'a> TotalHash for BytesHash<'a> {
     }
 }
 
-impl<'a> TotalEq for BytesHash<'a> {
+impl TotalEq for BytesHash<'_> {
     #[inline(always)]
     fn tot_eq(&self, other: &Self) -> bool {
         self == other
@@ -470,7 +472,7 @@ impl<'a> TotalEq for BytesHash<'a> {
 
 /// This elides creating a [`TotalOrdWrap`] for types that don't need it.
 pub trait ToTotalOrd {
-    type TotalOrdItem;
+    type TotalOrdItem: Hash + Eq;
     type SourceItem;
 
     fn to_total_ord(&self) -> Self::TotalOrdItem;
@@ -562,7 +564,7 @@ impl_to_total_ord_wrapped!(f64);
 /// `TotalOrdWrap<Option<T>>` implements `Eq + Hash`, iff:
 /// `Option<T>` implements `TotalEq + TotalHash`, iff:
 /// `T` implements `TotalEq + TotalHash`
-impl<T: Copy> ToTotalOrd for Option<T> {
+impl<T: Copy + TotalEq + TotalHash> ToTotalOrd for Option<T> {
     type TotalOrdItem = TotalOrdWrap<Option<T>>;
     type SourceItem = Option<T>;
 

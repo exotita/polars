@@ -1,4 +1,3 @@
-pub(super) mod multiple_keys;
 pub(super) mod single_keys;
 mod single_keys_dispatch;
 mod single_keys_inner;
@@ -8,25 +7,23 @@ mod single_keys_outer;
 mod single_keys_semi_anti;
 pub(super) mod sort_merge;
 use arrow::array::ArrayRef;
-pub use multiple_keys::private_left_join_multiple_keys;
-pub(super) use multiple_keys::*;
-use polars_core::utils::{_set_partition_size, split_ca};
+use polars_core::utils::_set_partition_size;
 use polars_core::POOL;
 use polars_utils::index::ChunkId;
 pub(super) use single_keys::*;
 #[cfg(feature = "asof_join")]
-pub(super) use single_keys_dispatch::prepare_bytes;
+pub(super) use single_keys_dispatch::prepare_binary;
 pub use single_keys_dispatch::SeriesJoin;
 use single_keys_inner::*;
 use single_keys_left::*;
 use single_keys_outer::*;
 #[cfg(feature = "semi_anti_join")]
 use single_keys_semi_anti::*;
-pub use sort_merge::*;
+pub(crate) use sort_merge::*;
 
 pub use super::*;
 #[cfg(feature = "chunked_ids")]
-use crate::chunked_array::gather::chunked::DfTake;
+use crate::chunked_array::gather::chunked::TakeChunkedHorPar;
 
 pub fn default_join_ids() -> ChunkJoinOptIds {
     #[cfg(feature = "chunked_ids")]
@@ -58,9 +55,18 @@ pub trait JoinDispatch: IntoDf {
     /// # Safety
     /// Join tuples must be in bounds
     #[cfg(feature = "chunked_ids")]
-    unsafe fn create_left_df_chunked(&self, chunk_ids: &[ChunkId], left_join: bool) -> DataFrame {
+    unsafe fn create_left_df_chunked(
+        &self,
+        chunk_ids: &[ChunkId],
+        left_join: bool,
+        was_sliced: bool,
+    ) -> DataFrame {
         let df_self = self.to_df();
-        if left_join && chunk_ids.len() == df_self.height() {
+
+        let left_join_no_duplicate_matches =
+            left_join && !was_sliced && chunk_ids.len() == df_self.height();
+
+        if left_join_no_duplicate_matches {
             df_self.clone()
         } else {
             // left join keys are in ascending order
@@ -69,7 +75,7 @@ pub trait JoinDispatch: IntoDf {
             } else {
                 IsSorted::Not
             };
-            df_self._take_chunked_unchecked(chunk_ids, sorted)
+            df_self._take_chunked_unchecked_hor_par(chunk_ids, sorted)
         }
     }
 
@@ -79,14 +85,18 @@ pub trait JoinDispatch: IntoDf {
         &self,
         join_tuples: &[IdxSize],
         left_join: bool,
+        was_sliced: bool,
         sorted_tuple_idx: bool,
     ) -> DataFrame {
         let df_self = self.to_df();
-        if left_join && join_tuples.len() == df_self.height() {
+
+        let left_join_no_duplicate_matches =
+            sorted_tuple_idx && left_join && !was_sliced && join_tuples.len() == df_self.height();
+
+        if left_join_no_duplicate_matches {
             df_self.clone()
         } else {
-            // left join tuples are always in ascending order
-            let sorted = if left_join || sorted_tuple_idx {
+            let sorted = if sorted_tuple_idx {
                 IsSorted::Ascending
             } else {
                 IsSorted::Not
@@ -94,115 +104,6 @@ pub trait JoinDispatch: IntoDf {
 
             df_self._take_unchecked_slice_sorted(join_tuples, true, sorted)
         }
-    }
-
-    #[cfg(not(feature = "chunked_ids"))]
-    fn _finish_left_join(
-        &self,
-        ids: LeftJoinIds,
-        other: &DataFrame,
-        args: JoinArgs,
-    ) -> PolarsResult<DataFrame> {
-        let ca_self = self.to_df();
-        let (left_idx, right_idx) = ids;
-        let materialize_left =
-            || unsafe { ca_self._create_left_df_from_slice(&left_idx, true, true) };
-
-        let materialize_right = || {
-            let right_idx = &*right_idx;
-            unsafe { IdxCa::with_nullable_idx(right_idx, |idx| other.take_unchecked(idx)) }
-        };
-        let (df_left, df_right) = POOL.join(materialize_left, materialize_right);
-
-        _finish_join(df_left, df_right, args.suffix.as_deref())
-    }
-
-    #[cfg(feature = "chunked_ids")]
-    fn _finish_left_join(
-        &self,
-        ids: LeftJoinIds,
-        other: &DataFrame,
-        args: JoinArgs,
-    ) -> PolarsResult<DataFrame> {
-        let ca_self = self.to_df();
-        let suffix = &args.suffix;
-        let (left_idx, right_idx) = ids;
-        let materialize_left = || match left_idx {
-            ChunkJoinIds::Left(left_idx) => unsafe {
-                let mut left_idx = &*left_idx;
-                if let Some((offset, len)) = args.slice {
-                    left_idx = slice_slice(left_idx, offset, len);
-                }
-                ca_self._create_left_df_from_slice(left_idx, true, true)
-            },
-            ChunkJoinIds::Right(left_idx) => unsafe {
-                let mut left_idx = &*left_idx;
-                if let Some((offset, len)) = args.slice {
-                    left_idx = slice_slice(left_idx, offset, len);
-                }
-                ca_self.create_left_df_chunked(left_idx, true)
-            },
-        };
-
-        let materialize_right = || match right_idx {
-            ChunkJoinOptIds::Left(right_idx) => unsafe {
-                let mut right_idx = &*right_idx;
-                if let Some((offset, len)) = args.slice {
-                    right_idx = slice_slice(right_idx, offset, len);
-                }
-                IdxCa::with_nullable_idx(right_idx, |idx| other.take_unchecked(idx))
-            },
-            ChunkJoinOptIds::Right(right_idx) => unsafe {
-                let mut right_idx = &*right_idx;
-                if let Some((offset, len)) = args.slice {
-                    right_idx = slice_slice(right_idx, offset, len);
-                }
-                other._take_opt_chunked_unchecked(right_idx)
-            },
-        };
-        let (df_left, df_right) = POOL.join(materialize_left, materialize_right);
-
-        _finish_join(df_left, df_right, suffix.as_deref())
-    }
-
-    fn _left_join_from_series(
-        &self,
-        other: &DataFrame,
-        s_left: &Series,
-        s_right: &Series,
-        args: JoinArgs,
-        verbose: bool,
-    ) -> PolarsResult<DataFrame> {
-        let df_self = self.to_df();
-        #[cfg(feature = "dtype-categorical")]
-        _check_categorical_src(s_left.dtype(), s_right.dtype())?;
-
-        let mut left = df_self.clone();
-        let mut s_left = s_left.clone();
-        // Eagerly limit left if possible.
-        if let Some((offset, len)) = args.slice {
-            if offset == 0 {
-                left = left.slice(0, len);
-                s_left = s_left.slice(0, len);
-            }
-        }
-
-        // Ensure that the chunks are aligned otherwise we go OOB.
-        let mut right = Cow::Borrowed(other);
-        let mut s_right = s_right.clone();
-        if left.should_rechunk() {
-            left.as_single_chunk_par();
-            s_left = s_left.rechunk();
-        }
-        if right.should_rechunk() {
-            let mut other = other.clone();
-            other.as_single_chunk_par();
-            right = Cow::Owned(other);
-            s_right = s_right.rechunk();
-        }
-
-        let ids = sort_or_hash_left(&s_left, &s_right, verbose, args.validation, args.join_nulls)?;
-        left._finish_left_join(ids, &right.drop(s_right.name()).unwrap(), args)
     }
 
     #[cfg(feature = "semi_anti_join")]
@@ -228,17 +129,18 @@ pub trait JoinDispatch: IntoDf {
         s_right: &Series,
         slice: Option<(i64, usize)>,
         anti: bool,
+        nulls_equal: bool,
     ) -> PolarsResult<DataFrame> {
         let ca_self = self.to_df();
         #[cfg(feature = "dtype-categorical")]
         _check_categorical_src(s_left.dtype(), s_right.dtype())?;
 
-        let idx = s_left.hash_join_semi_anti(s_right, anti);
+        let idx = s_left.hash_join_semi_anti(s_right, anti, nulls_equal)?;
         // SAFETY:
         // indices are in bounds
         Ok(unsafe { ca_self._finish_anti_semi_join(&idx, slice) })
     }
-    fn _outer_join_from_series(
+    fn _full_join_from_series(
         &self,
         other: &DataFrame,
         s_left: &Series,
@@ -251,32 +153,59 @@ pub trait JoinDispatch: IntoDf {
 
         // Get the indexes of the joined relations
         let (mut join_idx_l, mut join_idx_r) =
-            s_left.hash_join_outer(s_right, args.validation, args.join_nulls)?;
+            s_left.hash_join_outer(s_right, args.validation, args.nulls_equal)?;
 
+        try_raise_keyboard_interrupt();
         if let Some((offset, len)) = args.slice {
             let (offset, len) = slice_offsets(offset, len, join_idx_l.len());
             join_idx_l.slice(offset, len);
             join_idx_r.slice(offset, len);
         }
-        let idx_ca_l = IdxCa::with_chunk("", join_idx_l);
-        let idx_ca_r = IdxCa::with_chunk("", join_idx_r);
+        let idx_ca_l = IdxCa::with_chunk("a".into(), join_idx_l);
+        let idx_ca_r = IdxCa::with_chunk("b".into(), join_idx_r);
 
-        // Take the left and right dataframes by join tuples
-        let (df_left, df_right) = POOL.join(
-            || unsafe { df_self.take_unchecked(&idx_ca_l) },
-            || unsafe { other.take_unchecked(&idx_ca_r) },
-        );
+        let (df_left, df_right) = if args.maintain_order != MaintainOrderJoin::None {
+            let mut df = DataFrame::new(vec![
+                idx_ca_l.into_series().into(),
+                idx_ca_r.into_series().into(),
+            ])?;
 
-        let JoinType::Outer { coalesce } = args.how else {
-            unreachable!()
+            let options = SortMultipleOptions::new()
+                .with_order_descending(false)
+                .with_maintain_order(true)
+                .with_nulls_last(true);
+
+            let columns = match args.maintain_order {
+                MaintainOrderJoin::Left => vec!["a"],
+                MaintainOrderJoin::LeftRight => vec!["a", "b"],
+                MaintainOrderJoin::Right => vec!["b"],
+                MaintainOrderJoin::RightLeft => vec!["b", "a"],
+                _ => unreachable!(),
+            };
+
+            df.sort_in_place(columns, options)?;
+
+            let join_tuples_left = df.column("a").unwrap().idx().unwrap();
+            let join_tuples_right = df.column("b").unwrap().idx().unwrap();
+            POOL.join(
+                || unsafe { df_self.take_unchecked(join_tuples_left) },
+                || unsafe { other.take_unchecked(join_tuples_right) },
+            )
+        } else {
+            POOL.join(
+                || unsafe { df_self.take_unchecked(&idx_ca_l) },
+                || unsafe { other.take_unchecked(&idx_ca_r) },
+            )
         };
-        let out = _finish_join(df_left, df_right, args.suffix.as_deref());
+
+        let coalesce = args.coalesce.coalesce(&JoinType::Full);
+        let out = _finish_join(df_left, df_right, args.suffix.clone());
         if coalesce {
-            Ok(_coalesce_outer_join(
+            Ok(_coalesce_full_join(
                 out?,
-                &[s_left.name()],
-                &[s_right.name()],
-                args.suffix.as_deref(),
+                &[s_left.name().clone()],
+                &[s_right.name().clone()],
+                args.suffix.clone(),
                 df_self,
             ))
         } else {

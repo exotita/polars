@@ -30,7 +30,7 @@ impl LazyFrame {
         function: Arc<dyn AnonymousScan>,
         args: ScanArgsAnonymous,
     ) -> PolarsResult<Self> {
-        let mut lf: LazyFrame = LogicalPlanBuilder::anonymous_scan(
+        let mut lf: LazyFrame = DslBuilder::anonymous_scan(
             function,
             args.schema,
             args.infer_schema_length,
@@ -42,7 +42,7 @@ impl LazyFrame {
         .into();
 
         if let Some(rc) = args.row_index {
-            lf = lf.with_row_index(&rc.name, Some(rc.offset))
+            lf = lf.with_row_index(rc.name.clone(), Some(rc.offset))
         };
 
         Ok(lf)

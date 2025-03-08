@@ -7,8 +7,9 @@ import numpy as np
 import pytest
 
 import polars as pl
+from polars.exceptions import DuplicateError
 from polars.testing import assert_frame_equal
-from polars.testing._constants import PARTITION_LIMIT
+from tests.unit.conftest import INTEGER_DTYPES
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -16,7 +17,7 @@ if TYPE_CHECKING:
 pytestmark = pytest.mark.xdist_group("streaming")
 
 
-@pytest.mark.slow()
+@pytest.mark.slow
 def test_streaming_group_by_sorted_fast_path_nulls_10273() -> None:
     df = pl.Series(
         name="x",
@@ -31,7 +32,7 @@ def test_streaming_group_by_sorted_fast_path_nulls_10273() -> None:
         .lazy()
         .group_by("x")
         .agg(pl.len())
-        .collect(streaming=True)
+        .collect(engine="old-streaming")
         .sort("x")
     ).to_dict(as_series=False) == {
         "x": [None, 0, 1, 2, 3],
@@ -65,8 +66,9 @@ def test_streaming_group_by_types() -> None:
                         pl.col("bool").last().alias("bool_last"),
                         pl.col("bool").mean().alias("bool_mean"),
                         pl.col("bool").sum().alias("bool_sum"),
-                        pl.col("date").sum().alias("date_sum"),
-                        pl.col("date").mean().alias("date_mean"),
+                        # pl.col("date").sum().alias("date_sum"),
+                        # Date streaming mean/median has been temporarily disabled
+                        # pl.col("date").mean().alias("date_mean"),
                         pl.col("date").first().alias("date_first"),
                         pl.col("date").last().alias("date_last"),
                         pl.col("date").min().alias("date_min"),
@@ -75,7 +77,7 @@ def test_streaming_group_by_types() -> None:
                 )
             )
             .select(pl.all().exclude(by))
-            .collect(streaming=True)
+            .collect(engine="old-streaming")
         )
         assert out.schema == {
             "str_first": pl.String,
@@ -86,8 +88,8 @@ def test_streaming_group_by_types() -> None:
             "bool_last": pl.Boolean,
             "bool_mean": pl.Float64,
             "bool_sum": pl.UInt32,
-            "date_sum": pl.Date,
-            "date_mean": pl.Date,
+            # "date_sum": pl.Date,
+            # "date_mean": pl.Date,
             "date_first": pl.Date,
             "date_last": pl.Date,
             "date_min": pl.Date,
@@ -101,17 +103,18 @@ def test_streaming_group_by_types() -> None:
             "str_sum": [None],
             "bool_first": [True],
             "bool_last": [False],
-            "bool_mean": [None],
+            "bool_mean": [0.5],
             "bool_sum": [1],
-            "date_sum": [date(2074, 1, 1)],
-            "date_mean": [date(2022, 1, 1)],
+            # "date_sum": [None],
+            # Date streaming mean/median has been temporarily disabled
+            # "date_mean": [date(2022, 1, 1)],
             "date_first": [date(2022, 1, 1)],
             "date_last": [date(2022, 1, 1)],
             "date_min": [date(2022, 1, 1)],
             "date_max": [date(2022, 1, 1)],
         }
 
-    with pytest.raises(pl.DuplicateError):
+    with pytest.raises(DuplicateError):
         (
             df.lazy()
             .group_by("person_id")
@@ -126,7 +129,7 @@ def test_streaming_group_by_types() -> None:
                 ]
             )
             .select(pl.all().exclude("person_id"))
-            .collect(streaming=True)
+            .collect(engine="old-streaming")
         )
 
 
@@ -152,14 +155,14 @@ def test_streaming_non_streaming_gb() -> None:
     n = 100
     df = pl.DataFrame({"a": np.random.randint(0, 20, n)})
     q = df.lazy().group_by("a").agg(pl.len()).sort("a")
-    assert_frame_equal(q.collect(streaming=True), q.collect())
+    assert_frame_equal(q.collect(engine="old-streaming"), q.collect())
 
     q = df.lazy().with_columns(pl.col("a").cast(pl.String))
     q = q.group_by("a").agg(pl.len()).sort("a")
-    assert_frame_equal(q.collect(streaming=True), q.collect())
+    assert_frame_equal(q.collect(engine="old-streaming"), q.collect())
     q = df.lazy().with_columns(pl.col("a").alias("b"))
     q = q.group_by(["a", "b"]).agg(pl.len(), pl.col("a").sum().alias("sum_a")).sort("a")
-    assert_frame_equal(q.collect(streaming=True), q.collect())
+    assert_frame_equal(q.collect(engine="old-streaming"), q.collect())
 
 
 def test_streaming_group_by_sorted_fast_path() -> None:
@@ -191,7 +194,7 @@ def test_streaming_group_by_sorted_fast_path() -> None:
                     ]
                 )
                 .sort("a")
-                .collect(streaming=streaming)
+                .collect(engine="old-streaming" if streaming else "in-memory")
             )
             results.append(out)
 
@@ -204,7 +207,7 @@ def random_integers() -> pl.Series:
     return pl.Series("a", np.random.randint(0, 10, 100), dtype=pl.Int64)
 
 
-@pytest.mark.write_disk()
+@pytest.mark.write_disk
 def test_streaming_group_by_ooc_q1(
     random_integers: pl.Series,
     tmp_path: Path,
@@ -219,7 +222,7 @@ def test_streaming_group_by_ooc_q1(
         lf.group_by("a")
         .agg(pl.first("a").alias("a_first"), pl.last("a").alias("a_last"))
         .sort("a")
-        .collect(streaming=True)
+        .collect(engine="old-streaming")
     )
 
     expected = pl.DataFrame(
@@ -232,7 +235,7 @@ def test_streaming_group_by_ooc_q1(
     assert_frame_equal(result, expected)
 
 
-@pytest.mark.write_disk()
+@pytest.mark.write_disk
 def test_streaming_group_by_ooc_q2(
     random_integers: pl.Series,
     tmp_path: Path,
@@ -247,7 +250,7 @@ def test_streaming_group_by_ooc_q2(
         lf.group_by("a")
         .agg(pl.first("a").alias("a_first"), pl.last("a").alias("a_last"))
         .sort("a")
-        .collect(streaming=True)
+        .collect(engine="old-streaming")
     )
 
     expected = pl.DataFrame(
@@ -260,7 +263,7 @@ def test_streaming_group_by_ooc_q2(
     assert_frame_equal(result, expected)
 
 
-@pytest.mark.write_disk()
+@pytest.mark.write_disk
 def test_streaming_group_by_ooc_q3(
     random_integers: pl.Series,
     tmp_path: Path,
@@ -275,7 +278,7 @@ def test_streaming_group_by_ooc_q3(
         lf.group_by("a", "b")
         .agg(pl.first("a").alias("a_first"), pl.last("a").alias("a_last"))
         .sort("a")
-        .collect(streaming=True)
+        .collect(engine="old-streaming")
     )
 
     expected = pl.DataFrame(
@@ -295,7 +298,7 @@ def test_streaming_group_by_struct_key() -> None:
     )
     df1 = df.lazy().with_columns(pl.struct(["A", "C"]).alias("tuples"))
     assert df1.group_by("tuples").agg(pl.len(), pl.col("B").first()).sort("B").collect(
-        streaming=True
+        engine="old-streaming"
     ).to_dict(as_series=False) == {
         "tuples": [{"A": 3, "C": 4}, {"A": 1, "C": 2}, {"A": 2, "C": 3}],
         "len": [1, 1, 2],
@@ -303,7 +306,7 @@ def test_streaming_group_by_struct_key() -> None:
     }
 
 
-@pytest.mark.slow()
+@pytest.mark.slow
 def test_streaming_group_by_all_numeric_types_stability_8570() -> None:
     m = 1000
     n = 1000
@@ -319,14 +322,14 @@ def test_streaming_group_by_all_numeric_types_stability_8570() -> None:
     dfc = dfa.join(dfb, how="cross")
 
     for keys in [["x", "y"], "z"]:
-        for dtype in [pl.Boolean, *pl.INTEGER_DTYPES]:
+        for dtype in [*INTEGER_DTYPES, pl.Boolean]:
             # the alias checks if the schema is correctly handled
             dfd = (
                 dfc.lazy()
                 .with_columns(pl.col("z").cast(dtype))
                 .group_by(keys)
                 .agg(pl.col("z").sum().alias("z_sum"))
-                .collect(streaming=True)
+                .collect(engine="old-streaming")
             )
             assert dfd["z_sum"].sum() == dfc["z"].sum()
 
@@ -351,7 +354,7 @@ def test_streaming_group_by_categorical_aggregate() -> None:
             )
             .group_by(["a", "b"])
             .agg([pl.col("a").first().alias("sum")])
-            .collect(streaming=True)
+            .collect(engine="old-streaming")
         )
 
     assert out.sort("b").to_dict(as_series=False) == {
@@ -376,7 +379,7 @@ def test_streaming_group_by_list_9758() -> None:
         pl.LazyFrame(payload)
         .group_by("a")
         .first()
-        .collect(streaming=True)
+        .collect(engine="old-streaming")
         .to_dict(as_series=False)
         == payload
     )
@@ -397,7 +400,7 @@ def test_streaming_restart_non_streamable_group_by() -> None:
         )  # non-streamable UDF + nested_agg
     )
 
-    assert """--- STREAMING""" in res.explain(streaming=True)
+    assert "STREAMING" in res.explain(engine="old-streaming")
 
 
 def test_group_by_min_max_string_type() -> None:
@@ -410,7 +413,7 @@ def test_group_by_min_max_string_type() -> None:
             table.lazy()
             .group_by("a")
             .agg([pl.min("b").alias("min"), pl.max("b").alias("max")])
-            .collect(streaming=streaming)
+            .collect(engine="old-streaming" if streaming else "in-memory")
             .sort("a")
             .to_dict(as_series=False)
             == expected
@@ -426,7 +429,7 @@ def test_streaming_group_by_literal(literal: Any) -> None:
             pl.col("a").count().alias("a_count"),
             pl.col("a").sum().alias("a_sum"),
         ]
-    ).collect(streaming=True).to_dict(as_series=False) == {
+    ).collect(engine="old-streaming").to_dict(as_series=False) == {
         "literal": [literal],
         "a_count": [20],
         "a_sum": [190],
@@ -443,7 +446,7 @@ def test_group_by_multiple_keys_one_literal(streaming: bool) -> None:
         .group_by("a", pl.lit(1))
         .agg(pl.col("b").max())
         .sort(["a", "b"])
-        .collect(streaming=streaming)
+        .collect(engine="old-streaming" if streaming else "in-memory")
         .to_dict(as_series=False)
         == expected
     )
@@ -451,12 +454,12 @@ def test_group_by_multiple_keys_one_literal(streaming: bool) -> None:
 
 def test_streaming_group_null_count() -> None:
     df = pl.DataFrame({"g": [1] * 6, "a": ["yes", None] * 3}).lazy()
-    assert df.group_by("g").agg(pl.col("a").count()).collect(streaming=True).to_dict(
-        as_series=False
-    ) == {"g": [1], "a": [3]}
+    assert df.group_by("g").agg(pl.col("a").count()).collect(
+        engine="old-streaming"
+    ).to_dict(as_series=False) == {"g": [1], "a": [3]}
 
 
-def test_streaming_groupby_binary_15116() -> None:
+def test_streaming_group_by_binary_15116() -> None:
     assert (
         pl.LazyFrame(
             {
@@ -477,14 +480,54 @@ def test_streaming_groupby_binary_15116() -> None:
         .select([pl.col("str").cast(pl.Binary)])
         .group_by(["str"])
         .agg([pl.len().alias("count")])
-    ).sort("str").collect(streaming=True).to_dict(as_series=False) == {
+    ).sort("str").collect(engine="old-streaming").to_dict(as_series=False) == {
         "str": [b"A", b"BB", b"CCCC", b"DDDDDDDD", b"EEEEEEEEEEEEEEEE"],
         "count": [3, 2, 2, 2, 1],
     }
 
 
-def test_streaming_group_by_convert_15380() -> None:
+def test_streaming_group_by_convert_15380(partition_limit: int) -> None:
     assert (
-        pl.DataFrame({"a": [1] * PARTITION_LIMIT}).group_by(b="a").len()["len"].item()
-        == PARTITION_LIMIT
+        pl.DataFrame({"a": [1] * partition_limit}).group_by(b="a").len()["len"].item()
+        == partition_limit
     )
+
+
+@pytest.mark.parametrize("streaming", [True, False])
+@pytest.mark.parametrize("n_rows_limit_offset", [-1, +3])
+def test_streaming_group_by_boolean_mean_15610(
+    n_rows_limit_offset: int, streaming: bool, partition_limit: int
+) -> None:
+    n_rows = partition_limit + n_rows_limit_offset
+
+    # Also test non-streaming because it sometimes dispatched to streaming agg.
+    expect = pl.DataFrame({"a": [False, True], "c": [0.0, 0.5]})
+
+    n_repeats = n_rows // 3
+    assert n_repeats > 0
+
+    out = (
+        pl.select(
+            a=pl.repeat([True, False, True], n_repeats).explode(),
+            b=pl.repeat([True, False, False], n_repeats).explode(),
+        )
+        .lazy()
+        .group_by("a")
+        .agg(c=pl.mean("b"))
+        .sort("a")
+        .collect(engine="old-streaming" if streaming else "in-memory")
+    )
+
+    assert_frame_equal(out, expect)
+
+
+def test_streaming_group_by_all_null_21593() -> None:
+    df = pl.DataFrame(
+        {
+            "col_1": ["A", "B", "C", "D"],
+            "col_2": ["test", None, None, None],
+        }
+    )
+
+    out = df.lazy().group_by(pl.all()).min().collect(engine="streaming")
+    assert_frame_equal(df, out, check_row_order=False)

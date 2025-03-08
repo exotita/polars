@@ -1,5 +1,5 @@
 use arrow::array::PrimitiveArray;
-use arrow::compute::utils::combine_validities_and;
+use arrow::compute::utils::combine_validities_and3;
 use polars_core::prelude::*;
 use polars_core::utils::align_chunks_ternary;
 use polars_core::with_match_physical_numeric_polars_type;
@@ -11,10 +11,7 @@ fn fma_arr<T: NumericNative>(
     c: &PrimitiveArray<T>,
 ) -> PrimitiveArray<T> {
     assert_eq!(a.len(), b.len());
-    let validity = combine_validities_and(
-        combine_validities_and(a.validity(), b.validity()).as_ref(),
-        c.validity(),
-    );
+    let validity = combine_validities_and3(a.validity(), b.validity(), c.validity());
     let a = a.values().as_slice();
     let b = b.values().as_slice();
     let c = c.values().as_slice();
@@ -41,20 +38,23 @@ fn fma_ca<T: PolarsNumericType>(
         .zip(b.downcast_iter())
         .zip(c.downcast_iter())
         .map(|((a, b), c)| fma_arr(a, b, c));
-    ChunkedArray::from_chunk_iter(a.name(), chunks)
+    ChunkedArray::from_chunk_iter(a.name().clone(), chunks)
 }
 
-pub fn fma_series(a: &Series, b: &Series, c: &Series) -> Series {
+pub fn fma_columns(a: &Column, b: &Column, c: &Column) -> Column {
     if a.len() == b.len() && a.len() == c.len() {
         with_match_physical_numeric_polars_type!(a.dtype(), |$T| {
-            let a: &ChunkedArray<$T> = a.as_ref().as_ref().as_ref();
-            let b: &ChunkedArray<$T> = b.as_ref().as_ref().as_ref();
-            let c: &ChunkedArray<$T> = c.as_ref().as_ref().as_ref();
+            let a: &ChunkedArray<$T> = a.as_materialized_series().as_ref().as_ref().as_ref();
+            let b: &ChunkedArray<$T> = b.as_materialized_series().as_ref().as_ref().as_ref();
+            let c: &ChunkedArray<$T> = c.as_materialized_series().as_ref().as_ref().as_ref();
 
-            fma_ca(a, b, c).into_series()
+            fma_ca(a, b, c).into_column()
         })
     } else {
-        a + &(b * c)
+        (a.as_materialized_series()
+            + &(b.as_materialized_series() * c.as_materialized_series()).unwrap())
+            .unwrap()
+            .into()
     }
 }
 
@@ -65,10 +65,7 @@ fn fsm_arr<T: NumericNative>(
     c: &PrimitiveArray<T>,
 ) -> PrimitiveArray<T> {
     assert_eq!(a.len(), b.len());
-    let validity = combine_validities_and(
-        combine_validities_and(a.validity(), b.validity()).as_ref(),
-        c.validity(),
-    );
+    let validity = combine_validities_and3(a.validity(), b.validity(), c.validity());
     let a = a.values().as_slice();
     let b = b.values().as_slice();
     let c = c.values().as_slice();
@@ -95,20 +92,23 @@ fn fsm_ca<T: PolarsNumericType>(
         .zip(b.downcast_iter())
         .zip(c.downcast_iter())
         .map(|((a, b), c)| fsm_arr(a, b, c));
-    ChunkedArray::from_chunk_iter(a.name(), chunks)
+    ChunkedArray::from_chunk_iter(a.name().clone(), chunks)
 }
 
-pub fn fsm_series(a: &Series, b: &Series, c: &Series) -> Series {
+pub fn fsm_columns(a: &Column, b: &Column, c: &Column) -> Column {
     if a.len() == b.len() && a.len() == c.len() {
         with_match_physical_numeric_polars_type!(a.dtype(), |$T| {
-            let a: &ChunkedArray<$T> = a.as_ref().as_ref().as_ref();
-            let b: &ChunkedArray<$T> = b.as_ref().as_ref().as_ref();
-            let c: &ChunkedArray<$T> = c.as_ref().as_ref().as_ref();
+            let a: &ChunkedArray<$T> = a.as_materialized_series().as_ref().as_ref().as_ref();
+            let b: &ChunkedArray<$T> = b.as_materialized_series().as_ref().as_ref().as_ref();
+            let c: &ChunkedArray<$T> = c.as_materialized_series().as_ref().as_ref().as_ref();
 
-            fsm_ca(a, b, c).into_series()
+            fsm_ca(a, b, c).into_column()
         })
     } else {
-        a - &(b * c)
+        (a.as_materialized_series()
+            - &(b.as_materialized_series() * c.as_materialized_series()).unwrap())
+            .unwrap()
+            .into()
     }
 }
 
@@ -118,10 +118,7 @@ fn fms_arr<T: NumericNative>(
     c: &PrimitiveArray<T>,
 ) -> PrimitiveArray<T> {
     assert_eq!(a.len(), b.len());
-    let validity = combine_validities_and(
-        combine_validities_and(a.validity(), b.validity()).as_ref(),
-        c.validity(),
-    );
+    let validity = combine_validities_and3(a.validity(), b.validity(), c.validity());
     let a = a.values().as_slice();
     let b = b.values().as_slice();
     let c = c.values().as_slice();
@@ -148,19 +145,22 @@ fn fms_ca<T: PolarsNumericType>(
         .zip(b.downcast_iter())
         .zip(c.downcast_iter())
         .map(|((a, b), c)| fms_arr(a, b, c));
-    ChunkedArray::from_chunk_iter(a.name(), chunks)
+    ChunkedArray::from_chunk_iter(a.name().clone(), chunks)
 }
 
-pub fn fms_series(a: &Series, b: &Series, c: &Series) -> Series {
+pub fn fms_columns(a: &Column, b: &Column, c: &Column) -> Column {
     if a.len() == b.len() && a.len() == c.len() {
         with_match_physical_numeric_polars_type!(a.dtype(), |$T| {
-            let a: &ChunkedArray<$T> = a.as_ref().as_ref().as_ref();
-            let b: &ChunkedArray<$T> = b.as_ref().as_ref().as_ref();
-            let c: &ChunkedArray<$T> = c.as_ref().as_ref().as_ref();
+            let a: &ChunkedArray<$T> = a.as_materialized_series().as_ref().as_ref().as_ref();
+            let b: &ChunkedArray<$T> = b.as_materialized_series().as_ref().as_ref().as_ref();
+            let c: &ChunkedArray<$T> = c.as_materialized_series().as_ref().as_ref().as_ref();
 
-            fms_ca(a, b, c).into_series()
+            fms_ca(a, b, c).into_column()
         })
     } else {
-        &(a * b) - c
+        (&(a.as_materialized_series() * b.as_materialized_series()).unwrap()
+            - c.as_materialized_series())
+        .unwrap()
+        .into()
     }
 }

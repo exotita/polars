@@ -5,6 +5,7 @@ from datetime import date
 import pytest
 
 import polars as pl
+from polars.exceptions import ComputeError
 from polars.testing import assert_frame_equal, assert_series_equal
 
 
@@ -40,18 +41,18 @@ def test_shift_frame(fruits_cars: pl.DataFrame) -> None:
             assert res[rows, cols] is None
 
 
-def test_shift_and_fill() -> None:
+def test_shift_fill_value() -> None:
     ldf = pl.LazyFrame({"a": [1, 2, 3, 4, 5], "b": [1, 2, 3, 4, 5]})
 
     # use exprs
     out = ldf.with_columns(
         pl.col("a").shift(n=-2, fill_value=pl.col("b").mean())
     ).collect()
-    assert out["a"].null_count() == 0
+    assert not out["a"].has_nulls()
 
     # use df method
     out = ldf.shift(n=2, fill_value=pl.col("b").std()).collect()
-    assert out["a"].null_count() == 0
+    assert not out["a"].has_nulls()
 
 
 def test_shift_expr() -> None:
@@ -76,6 +77,7 @@ def test_shift_expr() -> None:
     assert out.to_dict(as_series=False) == {"a": [5, 5, 1, 2, 3], "b": [5, 5, 1, 2, 3]}
 
 
+@pytest.mark.may_fail_auto_streaming
 def test_shift_categorical() -> None:
     df = pl.Series("a", ["a", "b"], dtype=pl.Categorical).to_frame()
 
@@ -103,7 +105,7 @@ def test_shift_frame_with_fill() -> None:
     assert_frame_equal(result, expected)
 
 
-def test_shift_and_fill_group_logicals() -> None:
+def test_shift_fill_value_group_logicals() -> None:
     df = pl.DataFrame(
         [
             (date(2001, 1, 2), "A"),
@@ -113,27 +115,66 @@ def test_shift_and_fill_group_logicals() -> None:
             (date(2001, 1, 4), "B"),
         ],
         schema=["d", "s"],
+        orient="row",
     )
     result = df.select(pl.col("d").shift(fill_value=pl.col("d").max(), n=-1).over("s"))
 
     assert result.dtypes == [pl.Date]
 
 
-def test_shift_and_fill_deprecated() -> None:
-    a = pl.Series("a", [1, 2, 3])
+def test_shift_n_null() -> None:
+    df = pl.DataFrame({"a": pl.Series([1, 2, 3], dtype=pl.Int32)})
+    out = df.shift(None)  # type: ignore[arg-type]
+    expected = pl.DataFrame({"a": pl.Series([None, None, None], dtype=pl.Int32)})
+    assert_frame_equal(out, expected)
 
-    with pytest.deprecated_call():
-        result = a.shift_and_fill(100, n=-1)
+    out = df.shift(None, fill_value=1)  # type: ignore[arg-type]
+    assert_frame_equal(out, expected)
 
-    expected = pl.Series("a", [2, 3, 100])
-    assert_series_equal(result, expected)
+    out = df.select(pl.col("a").shift(None))  # type: ignore[arg-type]
+    assert_frame_equal(out, expected)
+
+    out = df.select(pl.col("a").shift(None, fill_value=1))  # type: ignore[arg-type]
+    assert_frame_equal(out, expected)
 
 
-def test_shift_and_fill_frame_deprecated() -> None:
-    lf = pl.LazyFrame({"a": [1, 2, 3], "b": [4, 5, 6]})
+def test_shift_n_nonscalar() -> None:
+    df = pl.DataFrame(
+        {
+            "a": [1, 2, 3],
+            "b": [4, 5, 6],
+        }
+    )
+    with pytest.raises(
+        ComputeError,
+        match="'n' must be scalar value",
+    ):
+        # Note: Expressions are not in the signature for `n`, but they work.
+        # We can still verify that n is scalar up-front.
+        df.shift(pl.col("b"), fill_value=1)  # type: ignore[arg-type]
 
-    with pytest.deprecated_call():
-        result = lf.shift_and_fill(100, n=1)
+    with pytest.raises(
+        ComputeError,
+        match="'n' must be scalar value",
+    ):
+        df.select(pl.col("a").shift(pl.col("b"), fill_value=1))
 
-    expected = pl.LazyFrame({"a": [100, 1, 2], "b": [100, 4, 5]})
-    assert_frame_equal(result, expected)
+
+def test_shift_fill_value_nonscalar() -> None:
+    df = pl.DataFrame(
+        {
+            "a": [1, 2, 3],
+            "b": [4, 5, 6],
+        }
+    )
+    with pytest.raises(
+        ComputeError,
+        match="'fill_value' must be scalar value",
+    ):
+        df.shift(1, fill_value=pl.col("b"))
+
+    with pytest.raises(
+        ComputeError,
+        match="'fill_value' must be scalar value",
+    ):
+        df.select(pl.col("a").shift(1, fill_value=pl.col("b")))

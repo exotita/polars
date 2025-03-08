@@ -1,12 +1,11 @@
 use std::ops::Deref;
-use std::sync::Arc;
-use std::usize;
 
 use either::Either;
 use num_traits::Zero;
 
-use super::{Bytes, IntoIter};
-use crate::array::ArrayAccessor;
+use super::IntoIter;
+use crate::array::{ArrayAccessor, Splitable};
+use crate::storage::SharedStorage;
 
 /// [`Buffer`] is a contiguous memory region that can be shared across
 /// thread boundaries.
@@ -40,7 +39,7 @@ use crate::array::ArrayAccessor;
 #[derive(Clone)]
 pub struct Buffer<T> {
     /// The internal byte buffer.
-    storage: Arc<Bytes<T>>,
+    storage: SharedStorage<T>,
 
     /// A pointer into the buffer where our data starts.
     ptr: *const T,
@@ -49,8 +48,8 @@ pub struct Buffer<T> {
     length: usize,
 }
 
-unsafe impl<T: Sync> Sync for Buffer<T> {}
-unsafe impl<T: Send> Send for Buffer<T> {}
+unsafe impl<T: Send + Sync> Sync for Buffer<T> {}
+unsafe impl<T: Send + Sync> Send for Buffer<T> {}
 
 impl<T: PartialEq> PartialEq for Buffer<T> {
     #[inline]
@@ -80,14 +79,18 @@ impl<T> Buffer<T> {
     }
 
     /// Auxiliary method to create a new Buffer
-    pub(crate) fn from_bytes(bytes: Bytes<T>) -> Self {
-        let ptr = bytes.as_ptr();
-        let length = bytes.len();
+    pub fn from_storage(storage: SharedStorage<T>) -> Self {
+        let ptr = storage.as_ptr();
+        let length = storage.len();
         Buffer {
-            storage: Arc::new(bytes),
+            storage,
             ptr,
             length,
         }
+    }
+
+    pub fn from_static(data: &'static [T]) -> Self {
+        Self::from_storage(SharedStorage::from_static(data))
     }
 
     /// Returns the number of bytes in the buffer
@@ -107,6 +110,20 @@ impl<T> Buffer<T> {
     /// more data than the length of `Self`.
     pub fn is_sliced(&self) -> bool {
         self.storage.len() != self.length
+    }
+
+    /// Expands this slice to the maximum allowed by the underlying storage.
+    /// Only expands towards the end, the offset isn't changed. That is, element
+    /// i before and after this operation refer to the same element.
+    pub fn expand_end_to_storage(self) -> Self {
+        unsafe {
+            let offset = self.ptr.offset_from(self.storage.as_ptr()) as usize;
+            Self {
+                ptr: self.ptr,
+                length: self.storage.len() - offset,
+                storage: self.storage,
+            }
+        }
     }
 
     /// Returns the byte slice stored in this buffer
@@ -146,7 +163,7 @@ impl<T> Buffer<T> {
 
     /// Slices this buffer starting at `offset`.
     /// # Panics
-    /// Panics iff `offset` is larger than `len`.
+    /// Panics iff `offset + length` is larger than `len`.
     #[inline]
     pub fn slice(&mut self, offset: usize, length: usize) {
         assert!(
@@ -165,6 +182,8 @@ impl<T> Buffer<T> {
     #[inline]
     #[must_use]
     pub unsafe fn sliced_unchecked(mut self, offset: usize, length: usize) -> Self {
+        debug_assert!(offset + length <= self.len());
+
         self.slice_unchecked(offset, length);
         self
     }
@@ -205,7 +224,7 @@ impl<T> Buffer<T> {
     /// Returns a mutable reference to its underlying [`Vec`], if possible.
     ///
     /// This operation returns [`Either::Right`] iff this [`Buffer`]:
-    /// * has not been cloned (i.e. [`Arc`]`::get_mut` yields [`Some`])
+    /// * has no alive clones
     /// * has not been imported from the C data interface (FFI)
     #[inline]
     pub fn into_mut(mut self) -> Either<Self, Vec<T>> {
@@ -213,36 +232,31 @@ impl<T> Buffer<T> {
         if self.is_sliced() {
             return Either::Left(self);
         }
-        match Arc::get_mut(&mut self.storage)
-            .and_then(|b| b.get_vec())
-            .map(std::mem::take)
-        {
-            Some(inner) => Either::Right(inner),
-            None => Either::Left(self),
+        match self.storage.try_into_vec() {
+            Ok(v) => Either::Right(v),
+            Err(slf) => {
+                self.storage = slf;
+                Either::Left(self)
+            },
         }
     }
 
     /// Returns a mutable reference to its slice, if possible.
     ///
     /// This operation returns [`Some`] iff this [`Buffer`]:
-    /// * has not been cloned (i.e. [`Arc`]`::get_mut` yields [`Some`])
+    /// * has no alive clones
     /// * has not been imported from the C data interface (FFI)
     #[inline]
     pub fn get_mut_slice(&mut self) -> Option<&mut [T]> {
         let offset = self.offset();
-        let unique = Arc::get_mut(&mut self.storage)?;
-        let vec = unique.get_vec()?;
-        Some(unsafe { vec.get_unchecked_mut(offset..offset + self.length) })
+        let slice = self.storage.try_as_mut_slice()?;
+        Some(unsafe { slice.get_unchecked_mut(offset..offset + self.length) })
     }
 
-    /// Get the strong count of underlying `Arc` data buffer.
-    pub fn shared_count_strong(&self) -> usize {
-        Arc::strong_count(&self.storage)
-    }
-
-    /// Get the weak count of underlying `Arc` data buffer.
-    pub fn shared_count_weak(&self) -> usize {
-        Arc::weak_count(&self.storage)
+    /// Since this takes a shared reference to self, beware that others might
+    /// increment this after you've checked it's equal to 1.
+    pub fn storage_refcount(&self) -> u64 {
+        self.storage.refcount()
     }
 }
 
@@ -263,15 +277,8 @@ impl<T: Zero + Copy> Buffer<T> {
 
 impl<T> From<Vec<T>> for Buffer<T> {
     #[inline]
-    fn from(p: Vec<T>) -> Self {
-        let bytes: Bytes<T> = p.into();
-        let ptr = bytes.as_ptr();
-        let length = bytes.len();
-        Self {
-            storage: Arc::new(bytes),
-            ptr,
-            length,
-        }
+    fn from(v: Vec<T>) -> Self {
+        Self::from_storage(SharedStorage::from_vec(v))
     }
 }
 
@@ -301,24 +308,6 @@ impl<T: Copy> IntoIterator for Buffer<T> {
     }
 }
 
-#[cfg(feature = "arrow_rs")]
-impl<T: crate::types::NativeType> From<arrow_buffer::Buffer> for Buffer<T> {
-    fn from(value: arrow_buffer::Buffer) -> Self {
-        Self::from_bytes(crate::buffer::to_bytes(value))
-    }
-}
-
-#[cfg(feature = "arrow_rs")]
-impl<T: crate::types::NativeType> From<Buffer<T>> for arrow_buffer::Buffer {
-    fn from(value: Buffer<T>) -> Self {
-        let offset = value.offset();
-        crate::buffer::to_buffer(value.storage).slice_with_length(
-            offset * std::mem::size_of::<T>(),
-            value.length * std::mem::size_of::<T>(),
-        )
-    }
-}
-
 unsafe impl<'a, T: 'a> ArrayAccessor<'a> for Buffer<T> {
     type Item = &'a T;
 
@@ -328,5 +317,29 @@ unsafe impl<'a, T: 'a> ArrayAccessor<'a> for Buffer<T> {
 
     fn len(&self) -> usize {
         Buffer::len(self)
+    }
+}
+
+impl<T> Splitable for Buffer<T> {
+    #[inline(always)]
+    fn check_bound(&self, offset: usize) -> bool {
+        offset <= self.len()
+    }
+
+    unsafe fn _split_at_unchecked(&self, offset: usize) -> (Self, Self) {
+        let storage = &self.storage;
+
+        (
+            Self {
+                storage: storage.clone(),
+                ptr: self.ptr,
+                length: offset,
+            },
+            Self {
+                storage: storage.clone(),
+                ptr: self.ptr.wrapping_add(offset),
+                length: self.length - offset,
+            },
+        )
     }
 }

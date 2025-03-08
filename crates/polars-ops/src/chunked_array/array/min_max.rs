@@ -25,7 +25,9 @@ where
         (0..values.len())
             .step_by(width)
             .map(|start| {
-                let sliced = unsafe { values.clone().sliced_unchecked(start, start + width) };
+                // SAFETY: This value array from a FixedSizeListArray,
+                // we can ensure that `start + width` will not out out range
+                let sliced = unsafe { values.clone().sliced_unchecked(start, width) };
                 arr_agg(&sliced)
             })
             .collect_arr()
@@ -66,7 +68,7 @@ where
 }
 
 pub(super) fn array_dispatch(
-    name: &str,
+    name: PlSmallStr,
     values: &Series,
     width: usize,
     agg_type: AggType,

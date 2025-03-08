@@ -5,8 +5,6 @@ from polars.functions.aggregation import (
     any_horizontal,
     cum_sum,
     cum_sum_horizontal,
-    cumsum,
-    cumsum_horizontal,
     max,
     max_horizontal,
     mean_horizontal,
@@ -16,6 +14,7 @@ from polars.functions.aggregation import (
     sum_horizontal,
 )
 from polars.functions.as_datatype import (
+    concat_arr,
     concat_list,
     concat_str,
     duration,
@@ -25,10 +24,11 @@ from polars.functions.as_datatype import (
 from polars.functions.as_datatype import date_ as date
 from polars.functions.as_datatype import datetime_ as datetime
 from polars.functions.as_datatype import time_ as time
+from polars.functions.business import business_day_count
 from polars.functions.col import col
 from polars.functions.eager import align_frames, concat
+from polars.functions.escape_regex import escape_regex
 from polars.functions.lazy import (
-    apply,
     approx_n_unique,
     arctan2,
     arctan2d,
@@ -43,10 +43,9 @@ from polars.functions.lazy import (
     cum_count,
     cum_fold,
     cum_reduce,
-    cumfold,
-    cumreduce,
     element,
     exclude,
+    field,
     first,
     fold,
     from_epoch,
@@ -54,12 +53,12 @@ from polars.functions.lazy import (
     head,
     implode,
     last,
-    map,
     map_batches,
     map_groups,
     mean,
     median,
     n_unique,
+    nth,
     quantile,
     reduce,
     rolling_corr,
@@ -81,6 +80,8 @@ from polars.functions.range import (
     datetime_ranges,
     int_range,
     int_ranges,
+    linear_space,
+    linear_spaces,
     time_range,
     time_ranges,
 )
@@ -92,14 +93,12 @@ __all__ = [
     "all",
     "any",
     "cum_sum",
-    "cumsum",
     "max",
     "min",
     "sum",
     "all_horizontal",
     "any_horizontal",
     "cum_sum_horizontal",
-    "cumsum_horizontal",
     "max_horizontal",
     "min_horizontal",
     "sum_horizontal",
@@ -119,15 +118,16 @@ __all__ = [
     "time_ranges",
     "zeros",
     # polars.functions.lazy
-    "apply",
     "arange",
     "arctan2",
     "arctan2d",
     "arg_sort_by",
+    "business_day_count",
     "coalesce",
     "col",
     "collect_all",
     "collect_all_async",
+    "concat_arr",
     "concat_list",
     "concat_str",
     "corr",
@@ -136,12 +136,11 @@ __all__ = [
     "cum_count",
     "cum_fold",
     "cum_reduce",
-    "cumfold",
-    "cumreduce",
     "date",  # named date_, see import above
     "datetime",  # named datetime_, see import above
     "duration",
     "exclude",
+    "field",
     "first",
     "fold",
     "format",
@@ -152,14 +151,16 @@ __all__ = [
     "int_range",
     "int_ranges",
     "last",
+    "linear_space",
+    "linear_spaces",
     "lit",
-    "map",
     "map_batches",
     "map_groups",
     "mean",
     "mean_horizontal",
     "median",
     "n_unique",
+    "nth",
     "quantile",
     "reduce",
     "rolling_corr",
@@ -176,4 +177,6 @@ __all__ = [
     # polars.functions.whenthen
     "when",
     "sql_expr",
+    # polars.functions.escape_regex
+    "escape_regex",
 ]

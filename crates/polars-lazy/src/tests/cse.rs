@@ -5,16 +5,18 @@ use super::*;
 fn cached_before_root(q: LazyFrame) {
     let (mut expr_arena, mut lp_arena) = get_arenas();
     let lp = q.optimize(&mut lp_arena, &mut expr_arena).unwrap();
-    for input in lp_arena.get(lp).get_inputs() {
-        assert!(matches!(lp_arena.get(input), ALogicalPlan::Cache { .. }));
+    for input in lp_arena.get(lp).get_inputs_vec() {
+        assert!(matches!(lp_arena.get(input), IR::Cache { .. }));
     }
 }
 
 fn count_caches(q: LazyFrame) -> usize {
-    let (node, lp_arena, _) = q.to_alp_optimized().unwrap();
+    let IRPlan {
+        lp_top, lp_arena, ..
+    } = q.to_alp_optimized().unwrap();
     (&lp_arena)
-        .iter(node)
-        .filter(|(_node, lp)| matches!(lp, ALogicalPlan::Cache { .. }))
+        .iter(lp_top)
+        .filter(|(_node, lp)| matches!(lp, IR::Cache { .. }))
         .count()
 }
 
@@ -55,7 +57,7 @@ fn test_cse_unions() -> PolarsResult<()> {
     let lp = lf.clone().optimize(&mut lp_arena, &mut expr_arena).unwrap();
     let mut cache_count = 0;
     assert!((&lp_arena).iter(lp).all(|(_, lp)| {
-        use ALogicalPlan::*;
+        use IR::*;
         match lp {
             Cache { .. } => {
                 cache_count += 1;
@@ -98,14 +100,14 @@ fn test_cse_cache_union_projection_pd() -> PolarsResult<()> {
     let lp = q.optimize(&mut lp_arena, &mut expr_arena).unwrap();
     let mut cache_count = 0;
     assert!((&lp_arena).iter(lp).all(|(_, lp)| {
-        use ALogicalPlan::*;
+        use IR::*;
         match lp {
             Cache { .. } => {
                 cache_count += 1;
                 true
             },
             DataFrameScan {
-                projection: Some(projection),
+                output_schema: Some(projection),
                 ..
             } => projection.as_ref().len() <= 2,
             DataFrameScan { .. } => false,
@@ -154,7 +156,7 @@ fn test_cse_union2_4925() -> PolarsResult<()> {
     let cache_ids = (&lp_arena)
         .iter(lp)
         .flat_map(|(_, lp)| {
-            use ALogicalPlan::*;
+            use IR::*;
             match lp {
                 Cache { id, cache_hits, .. } => {
                     assert_eq!(*cache_hits, 1);
@@ -202,12 +204,12 @@ fn test_cse_joins_4954() -> PolarsResult<()> {
     let (mut expr_arena, mut lp_arena) = get_arenas();
     let lp = c.optimize(&mut lp_arena, &mut expr_arena).unwrap();
 
-    // Ensure we get only one cache and the it is not above the join
+    // Ensure we get only one cache and it is not above the join
     // and ensure that every cache only has 1 hit.
     let cache_ids = (&lp_arena)
         .iter(lp)
         .flat_map(|(_, lp)| {
-            use ALogicalPlan::*;
+            use IR::*;
             match lp {
                 Cache {
                     id,
@@ -216,10 +218,7 @@ fn test_cse_joins_4954() -> PolarsResult<()> {
                     ..
                 } => {
                     assert_eq!(*cache_hits, 1);
-                    assert!(matches!(
-                        lp_arena.get(*input),
-                        ALogicalPlan::DataFrameScan { .. }
-                    ));
+                    assert!(matches!(lp_arena.get(*input), IR::SimpleProjection { .. }));
 
                     Some(*id)
                 },
@@ -279,7 +278,7 @@ fn test_cache_with_partial_projection() -> PolarsResult<()> {
     let cache_ids = (&lp_arena)
         .iter(lp)
         .flat_map(|(_, lp)| {
-            use ALogicalPlan::*;
+            use IR::*;
             match lp {
                 Cache { id, .. } => Some(*id),
                 _ => None,
@@ -306,9 +305,9 @@ fn test_cse_columns_projections() -> PolarsResult<()> {
     ]?
     .lazy();
 
-    let left = left.cross_join(right.clone().select([col("A")]));
+    let left = left.cross_join(right.clone().select([col("A")]), None);
     let q = left.join(
-        right.rename(["B"], ["C"]),
+        right.rename(["B"], ["C"], true),
         [col("A"), col("C")],
         [col("A"), col("C")],
         JoinType::Left.into(),

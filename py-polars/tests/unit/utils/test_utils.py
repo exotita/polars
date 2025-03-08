@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from datetime import date, datetime, time, timedelta
-from typing import TYPE_CHECKING, Any, Sequence
+from typing import TYPE_CHECKING, Any
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pytest
@@ -23,14 +24,11 @@ from polars._utils.various import (
     parse_percentiles,
     parse_version,
 )
-from polars.io._utils import _looks_like_url
 
 if TYPE_CHECKING:
-    from zoneinfo import ZoneInfo
+    from collections.abc import Sequence
 
-    from polars.type_aliases import TimeUnit
-else:
-    from polars._utils.convert import string_to_zoneinfo as ZoneInfo
+    from polars._typing import TimeUnit
 
 
 @pytest.mark.parametrize(
@@ -187,7 +185,7 @@ def test_parse_version(v1: Any, v2: Any) -> None:
     assert parse_version(v2) < parse_version(v1)
 
 
-@pytest.mark.slow()
+@pytest.mark.slow
 def test_in_notebook() -> None:
     # private function, but easier to test this separately and mock it in the callers
     assert not _in_notebook()
@@ -291,22 +289,3 @@ def test_is_str_sequence_check(
     assert is_str_sequence(sequence, include_series=include_series) == expected
     if expected:
         assert is_sequence(sequence, include_series=include_series)
-
-
-@pytest.mark.parametrize(
-    ("url", "result"),
-    [
-        ("HTTPS://pola.rs/data.csv", True),
-        ("http://pola.rs/data.csv", True),
-        ("ftps://pola.rs/data.csv", True),
-        ("FTP://pola.rs/data.csv", True),
-        ("htp://pola.rs/data.csv", False),
-        ("fttp://pola.rs/data.csv", False),
-        ("http_not_a_url", False),
-        ("ftp_not_a_url", False),
-        ("/mnt/data.csv", False),
-        ("file://mnt/data.csv", False),
-    ],
-)
-def test_looks_like_url(url: str, result: bool) -> None:
-    assert _looks_like_url(url) == result

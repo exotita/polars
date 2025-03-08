@@ -1,3 +1,5 @@
+use polars_core::utils::materialize_dyn_int;
+
 use super::*;
 
 impl FunctionExpr {
@@ -24,9 +26,16 @@ impl FunctionExpr {
             StructExpr(s) => s.get_field(mapper),
             #[cfg(feature = "temporal")]
             TemporalExpr(fun) => fun.get_field(mapper),
+            #[cfg(feature = "bitwise")]
+            Bitwise(fun) => fun.get_field(mapper),
 
             // Other expressions
             Boolean(func) => func.get_field(mapper),
+            #[cfg(feature = "business")]
+            Business(func) => match func {
+                BusinessFunction::BusinessDayCount { .. } => mapper.with_dtype(DataType::Int32),
+                BusinessFunction::AddBusinessDay { .. } => mapper.with_same_dtype(),
+            },
             #[cfg(feature = "abs")]
             Abs => mapper.with_same_dtype(),
             Negate => mapper.with_same_dtype(),
@@ -40,30 +49,39 @@ impl FunctionExpr {
             Hash(..) => mapper.with_dtype(DataType::UInt64),
             #[cfg(feature = "arg_where")]
             ArgWhere => mapper.with_dtype(IDX_DTYPE),
+            #[cfg(feature = "index_of")]
+            IndexOf => mapper.with_dtype(IDX_DTYPE),
             #[cfg(feature = "search_sorted")]
             SearchSorted(_) => mapper.with_dtype(IDX_DTYPE),
             #[cfg(feature = "range")]
             Range(func) => func.get_field(mapper),
-            #[cfg(feature = "date_offset")]
-            DateOffset { .. } => mapper.with_same_dtype(),
             #[cfg(feature = "trigonometry")]
             Trigonometry(_) => mapper.map_to_float_dtype(),
             #[cfg(feature = "trigonometry")]
             Atan2 => mapper.map_to_float_dtype(),
             #[cfg(feature = "sign")]
             Sign => mapper.with_dtype(DataType::Int64),
-            FillNull { super_type, .. } => mapper.with_dtype(super_type.clone()),
+            FillNull  => mapper.map_to_supertype(),
             #[cfg(feature = "rolling_window")]
             RollingExpr(rolling_func, ..) => {
                 use RollingFunction::*;
                 match rolling_func {
-                    Min(_) | MinBy(_) | Max(_) | MaxBy(_) | Sum(_) | SumBy(_) => {
-                        mapper.with_same_dtype()
-                    },
-                    Mean(_) | MeanBy(_) | Quantile(_) | QuantileBy(_) | Var(_) | VarBy(_)
-                    | Std(_) | StdBy(_) => mapper.map_to_float_dtype(),
+                    Min(_) | Max(_) => mapper.with_same_dtype(),
+                    Mean(_) | Quantile(_) | Var(_) | Std(_) => mapper.map_to_float_dtype(),
+                    Sum(_) => mapper.sum_dtype(),
+                    #[cfg(feature = "cov")]
+                    CorrCov {..} => mapper.map_to_float_dtype(),
                     #[cfg(feature = "moment")]
                     Skew(..) => mapper.map_to_float_dtype(),
+                }
+            },
+            #[cfg(feature = "rolling_window_by")]
+            RollingExprBy(rolling_func, ..) => {
+                use RollingFunctionBy::*;
+                match rolling_func {
+                    MinBy(_) | MaxBy(_) => mapper.with_same_dtype(),
+                    MeanBy(_) | QuantileBy(_) | VarBy(_) | StdBy(_) => mapper.map_to_float_dtype(),
+                    SumBy(_) => mapper.sum_dtype(),
                 }
             },
             ShiftAndFill => mapper.with_same_dtype(),
@@ -78,6 +96,7 @@ impl FunctionExpr {
             #[cfg(feature = "moment")]
             Kurtosis(..) => mapper.with_dtype(DataType::Float64),
             ArgUnique => mapper.with_dtype(IDX_DTYPE),
+            Repeat => mapper.with_same_dtype(),
             #[cfg(feature = "rank")]
             Rank { options, .. } => mapper.with_dtype(match options.method {
                 RankMethod::Average => DataType::Float64,
@@ -85,16 +104,28 @@ impl FunctionExpr {
             }),
             #[cfg(feature = "dtype-struct")]
             AsStruct => Ok(Field::new(
-                fields[0].name(),
+                fields[0].name().clone(),
                 DataType::Struct(fields.to_vec()),
             )),
             #[cfg(feature = "top_k")]
-            TopK(_) => mapper.with_same_dtype(),
+            TopK { .. } => mapper.with_same_dtype(),
+            #[cfg(feature = "top_k")]
+            TopKBy { .. } => mapper.with_same_dtype(),
             #[cfg(feature = "dtype-struct")]
-            ValueCounts { .. } => mapper.map_dtype(|dt| {
+            ValueCounts {
+                sort: _,
+                parallel: _,
+                name,
+                normalize,
+            } => mapper.map_dtype(|dt| {
+                let count_dt = if *normalize {
+                    DataType::Float64
+                } else {
+                    IDX_DTYPE
+                };
                 DataType::Struct(vec![
-                    Field::new(fields[0].name().as_str(), dt.clone()),
-                    Field::new("count", IDX_DTYPE),
+                    Field::new(fields[0].name().clone(), dt.clone()),
+                    Field::new(name.clone(), count_dt),
                 ])
             }),
             #[cfg(feature = "unique_counts")]
@@ -121,15 +152,18 @@ impl FunctionExpr {
                 if *include_breakpoint || *include_category {
                     let mut fields = Vec::with_capacity(3);
                     if *include_breakpoint {
-                        fields.push(Field::new("break_point", DataType::Float64));
+                        fields.push(Field::new(
+                            PlSmallStr::from_static("breakpoint"),
+                            DataType::Float64,
+                        ));
                     }
                     if *include_category {
                         fields.push(Field::new(
-                            "category",
+                            PlSmallStr::from_static("category"),
                             DataType::Categorical(None, Default::default()),
                         ));
                     }
-                    fields.push(Field::new("count", IDX_DTYPE));
+                    fields.push(Field::new(PlSmallStr::from_static("count"), IDX_DTYPE));
                     mapper.with_dtype(DataType::Struct(fields))
                 } else {
                     mapper.with_dtype(IDX_DTYPE)
@@ -158,6 +192,8 @@ impl FunctionExpr {
                 InterpolationMethod::Linear => mapper.map_numeric_to_float_dtype(),
                 InterpolationMethod::Nearest => mapper.with_same_dtype(),
             },
+            #[cfg(feature = "interpolate_by")]
+            InterpolateBy => mapper.map_numeric_to_float_dtype(),
             ShrinkType => {
                 // we return the smallest type this can return
                 // this might not be correct once the actual data
@@ -168,7 +204,7 @@ impl FunctionExpr {
                 // but we because only the numeric types deviate in
                 // bit size this will likely not lead to issues
                 mapper.map_dtype(|dt| {
-                    if dt.is_numeric() {
+                    if dt.is_primitive_numeric() {
                         if dt.is_float() {
                             DataType::Float32
                         } else if dt.is_unsigned_integer() {
@@ -206,12 +242,10 @@ impl FunctionExpr {
                 include_breaks: true,
                 ..
             } => {
-                let name = fields[0].name();
-                let name_bin = format!("{}_bin", name);
                 let struct_dt = DataType::Struct(vec![
-                    Field::new("brk", DataType::Float64),
+                    Field::new(PlSmallStr::from_static("breakpoint"), DataType::Float64),
                     Field::new(
-                        name_bin.as_str(),
+                        PlSmallStr::from_static("category"),
                         DataType::Categorical(None, Default::default()),
                     ),
                 ]);
@@ -219,13 +253,43 @@ impl FunctionExpr {
             },
             #[cfg(feature = "repeat_by")]
             RepeatBy => mapper.map_dtype(|dt| DataType::List(dt.clone().into())),
-            Reshape(dims) => mapper.map_dtype(|dt| {
+            #[cfg(feature = "dtype-array")]
+            Reshape(dims) => mapper.try_map_dtype(|dt: &DataType| {
                 let dtype = dt.inner_dtype().unwrap_or(dt).clone();
+
                 if dims.len() == 1 {
-                    dtype
-                } else {
-                    DataType::List(Box::new(dtype))
+                    return Ok(dtype);
                 }
+
+                let num_infers = dims.iter().filter(|d| matches!(d, ReshapeDimension::Infer)).count();
+
+                polars_ensure!(num_infers <= 1, InvalidOperation: "can only specify one inferred dimension");
+
+                let mut inferred_size = 0;
+                if num_infers == 1 {
+                    let mut total_size = 1u64;
+                    let mut current = dt;
+                    while let DataType::Array(dt, width) = current {
+                        if *width == 0 {
+                            total_size = 0;
+                            break;
+                        }
+
+                        current = dt.as_ref();
+                        total_size *= *width as u64;
+                    }
+
+                    let current_size = dims.iter().map(|d| d.get_or_infer(1)).product::<u64>();
+                    inferred_size = total_size / current_size;
+                }
+
+                let mut prev_dtype = dtype.leaf_dtype().clone();
+
+                // We pop the outer dimension as that is the height of the series.
+                for dim in &dims[1..] {
+                    prev_dtype = DataType::Array(Box::new(prev_dtype), dim.get_or_infer(inferred_size) as usize);
+                }
+                Ok(prev_dtype)
             }),
             #[cfg(feature = "cutqcut")]
             QCut {
@@ -237,12 +301,10 @@ impl FunctionExpr {
                 include_breaks: true,
                 ..
             } => {
-                let name = fields[0].name();
-                let name_bin = format!("{}_bin", name);
                 let struct_dt = DataType::Struct(vec![
-                    Field::new("brk", DataType::Float64),
+                    Field::new(PlSmallStr::from_static("breakpoint"), DataType::Float64),
                     Field::new(
-                        name_bin.as_str(),
+                        PlSmallStr::from_static("category"),
                         DataType::Categorical(None, Default::default()),
                     ),
                 ]);
@@ -251,12 +313,12 @@ impl FunctionExpr {
             #[cfg(feature = "rle")]
             RLE => mapper.map_dtype(|dt| {
                 DataType::Struct(vec![
-                    Field::new("lengths", DataType::Int32),
-                    Field::new("values", dt.clone()),
+                    Field::new(PlSmallStr::from_static("len"), IDX_DTYPE),
+                    Field::new(PlSmallStr::from_static("value"), dt.clone()),
                 ])
             }),
             #[cfg(feature = "rle")]
-            RLEID => mapper.with_dtype(DataType::UInt32),
+            RLEID => mapper.with_dtype(IDX_DTYPE),
             ToPhysical => mapper.to_physical_type(),
             #[cfg(feature = "random")]
             Random { .. } => mapper.with_same_dtype(),
@@ -271,22 +333,35 @@ impl FunctionExpr {
             ForwardFill { .. } => mapper.with_same_dtype(),
             MaxHorizontal => mapper.map_to_supertype(),
             MinHorizontal => mapper.map_to_supertype(),
-            SumHorizontal => {
-                if mapper.fields[0].data_type() == &DataType::Boolean {
-                    mapper.with_dtype(DataType::UInt32)
-                } else {
-                    mapper.map_to_supertype()
-                }
+            SumHorizontal { .. } => {
+                mapper.map_to_supertype().map(|mut f| {
+                    if f.dtype == DataType::Boolean {
+                        f.dtype = IDX_DTYPE;
+                    }
+                    f
+                })
             },
-            MeanHorizontal => mapper.map_to_float_dtype(),
+            MeanHorizontal { .. } => {
+                mapper.map_to_supertype().map(|mut f| {
+                    match f.dtype {
+                        dt @ DataType::Float32 => { f.dtype = dt; },
+                        _ => { f.dtype = DataType::Float64; },
+                    };
+                    f
+                })
+            }
             #[cfg(feature = "ewma")]
             EwmMean { .. } => mapper.map_to_float_dtype(),
+            #[cfg(feature = "ewma_by")]
+            EwmMeanBy { .. } => mapper.map_to_float_dtype(),
             #[cfg(feature = "ewma")]
             EwmStd { .. } => mapper.map_to_float_dtype(),
             #[cfg(feature = "ewma")]
             EwmVar { .. } => mapper.map_to_float_dtype(),
             #[cfg(feature = "replace")]
-            Replace { return_dtype } => mapper.replace_dtype(return_dtype.clone()),
+            Replace => mapper.with_same_dtype(),
+            #[cfg(feature = "replace")]
+            ReplaceStrict { return_dtype } => mapper.replace_dtype(return_dtype.clone()),
             FillNullWithStrategy(_) => mapper.with_same_dtype(),
             GatherEvery { .. } => mapper.with_same_dtype(),
             #[cfg(feature = "reinterpret")]
@@ -301,6 +376,16 @@ impl FunctionExpr {
             ExtendConstant => mapper.with_same_dtype(),
         }
     }
+
+    pub(crate) fn output_name(&self) -> Option<OutputName> {
+        match self {
+            #[cfg(feature = "dtype-struct")]
+            FunctionExpr::StructExpr(StructFunction::FieldByName(name)) => {
+                Some(OutputName::Field(name.clone()))
+            },
+            _ => None,
+        }
+    }
 }
 
 pub struct FieldsMapper<'a> {
@@ -312,6 +397,10 @@ impl<'a> FieldsMapper<'a> {
         Self { fields }
     }
 
+    pub fn args(&self) -> &[Field] {
+        self.fields
+    }
+
     /// Field with the same dtype.
     pub fn with_same_dtype(&self) -> PolarsResult<Field> {
         self.map_dtype(|dtype| dtype.clone())
@@ -319,13 +408,13 @@ impl<'a> FieldsMapper<'a> {
 
     /// Set a dtype.
     pub fn with_dtype(&self, dtype: DataType) -> PolarsResult<Field> {
-        Ok(Field::new(self.fields[0].name(), dtype))
+        Ok(Field::new(self.fields[0].name().clone(), dtype))
     }
 
     /// Map a single dtype.
     pub fn map_dtype(&self, func: impl FnOnce(&DataType) -> DataType) -> PolarsResult<Field> {
-        let dtype = func(self.fields[0].data_type());
-        Ok(Field::new(self.fields[0].name(), dtype))
+        let dtype = func(self.fields[0].dtype());
+        Ok(Field::new(self.fields[0].name().clone(), dtype))
     }
 
     pub fn get_fields_lens(&self) -> usize {
@@ -351,7 +440,7 @@ impl<'a> FieldsMapper<'a> {
     /// Map to a float supertype if numeric, else preserve
     pub fn map_numeric_to_float_dtype(&self) -> PolarsResult<Field> {
         self.map_dtype(|dtype| {
-            if dtype.is_numeric() {
+            if dtype.is_primitive_numeric() {
                 match dtype {
                     DataType::Float32 => DataType::Float32,
                     _ => DataType::Float64,
@@ -372,8 +461,8 @@ impl<'a> FieldsMapper<'a> {
         &self,
         func: impl FnOnce(&DataType) -> PolarsResult<DataType>,
     ) -> PolarsResult<Field> {
-        let dtype = func(self.fields[0].data_type())?;
-        Ok(Field::new(self.fields[0].name(), dtype))
+        let dtype = func(self.fields[0].dtype())?;
+        Ok(Field::new(self.fields[0].name().clone(), dtype))
     }
 
     /// Map all dtypes with a potentially failing mapper function.
@@ -385,7 +474,7 @@ impl<'a> FieldsMapper<'a> {
         let dtypes = self
             .fields
             .iter()
-            .map(|fld| fld.data_type())
+            .map(|fld| fld.dtype())
             .collect::<Vec<_>>();
         let new_type = func(&dtypes)?;
         fld.coerce(new_type);
@@ -394,11 +483,8 @@ impl<'a> FieldsMapper<'a> {
 
     /// Map the dtype to the "supertype" of all fields.
     pub fn map_to_supertype(&self) -> PolarsResult<Field> {
+        let st = args_to_supertype(self.fields)?;
         let mut first = self.fields[0].clone();
-        let mut st = first.data_type().clone();
-        for field in &self.fields[1..] {
-            st = try_get_supertype(&st, field.data_type())?
-        }
         first.coerce(st);
         Ok(first)
     }
@@ -407,12 +493,22 @@ impl<'a> FieldsMapper<'a> {
     pub fn map_to_list_and_array_inner_dtype(&self) -> PolarsResult<Field> {
         let mut first = self.fields[0].clone();
         let dt = first
-            .data_type()
+            .dtype()
             .inner_dtype()
             .cloned()
-            .unwrap_or(DataType::Unknown);
+            .unwrap_or_else(|| DataType::Unknown(Default::default()));
         first.coerce(dt);
         Ok(first)
+    }
+
+    #[cfg(feature = "dtype-array")]
+    /// Map the dtype to the dtype of the array elements, with typo validation.
+    pub fn try_map_to_array_inner_dtype(&self) -> PolarsResult<Field> {
+        let dt = self.fields[0].dtype();
+        match dt {
+            DataType::Array(_, _) => self.map_to_list_and_array_inner_dtype(),
+            _ => polars_bail!(InvalidOperation: "expected Array type, got: {}", dt),
+        }
     }
 
     /// Map the dtypes to the "supertype" of a list of lists.
@@ -452,34 +548,57 @@ impl<'a> FieldsMapper<'a> {
         })
     }
 
+    pub fn sum_dtype(&self) -> PolarsResult<Field> {
+        use DataType::*;
+        self.map_dtype(|dtype| match dtype {
+            Int8 | UInt8 | Int16 | UInt16 => Int64,
+            dt => dt.clone(),
+        })
+    }
+
     pub fn nested_sum_type(&self) -> PolarsResult<Field> {
         let mut first = self.fields[0].clone();
         use DataType::*;
-        let dt = first.data_type().inner_dtype().cloned().unwrap_or(Unknown);
+        let dt = first
+            .dtype()
+            .inner_dtype()
+            .cloned()
+            .unwrap_or_else(|| Unknown(Default::default()));
 
-        if matches!(dt, UInt8 | Int8 | Int16 | UInt16) {
-            first.coerce(Int64);
-        } else {
-            first.coerce(dt);
+        match dt {
+            Boolean => first.coerce(IDX_DTYPE),
+            UInt8 | Int8 | Int16 | UInt16 => first.coerce(Int64),
+            _ => first.coerce(dt),
         }
         Ok(first)
     }
 
     pub(super) fn pow_dtype(&self) -> PolarsResult<Field> {
-        // base, exponent
-        match (self.fields[0].data_type(), self.fields[1].data_type()) {
-            (
-                base_dtype,
-                DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64,
-            ) => Ok(Field::new(self.fields[0].name(), base_dtype.clone())),
-            (DataType::Float32, _) => Ok(Field::new(self.fields[0].name(), DataType::Float32)),
-            (_, _) => Ok(Field::new(self.fields[0].name(), DataType::Float64)),
+        let base_dtype = self.fields[0].dtype();
+        let exponent_dtype = self.fields[1].dtype();
+        if base_dtype.is_integer() {
+            if exponent_dtype.is_float() {
+                Ok(Field::new(
+                    self.fields[0].name().clone(),
+                    exponent_dtype.clone(),
+                ))
+            } else {
+                Ok(Field::new(
+                    self.fields[0].name().clone(),
+                    base_dtype.clone(),
+                ))
+            }
+        } else {
+            Ok(Field::new(
+                self.fields[0].name().clone(),
+                base_dtype.clone(),
+            ))
         }
     }
 
     #[cfg(feature = "extract_jsonpath")]
     pub fn with_opt_dtype(&self, dtype: Option<DataType>) -> PolarsResult<Field> {
-        let dtype = dtype.unwrap_or(DataType::Unknown);
+        let dtype = dtype.unwrap_or_else(|| DataType::Unknown(Default::default()));
         self.with_dtype(dtype)
     }
 
@@ -487,16 +606,41 @@ impl<'a> FieldsMapper<'a> {
     pub fn replace_dtype(&self, return_dtype: Option<DataType>) -> PolarsResult<Field> {
         let dtype = match return_dtype {
             Some(dtype) => dtype,
-            // Supertype of `new` and `default`
             None => {
-                let default = if let Some(default) = self.fields.get(3) {
-                    default
-                } else {
-                    &self.fields[0]
-                };
-                try_get_supertype(self.fields[2].data_type(), default.data_type())?
+                let new = &self.fields[2];
+                let default = self.fields.get(3);
+                match default {
+                    Some(default) => try_get_supertype(default.dtype(), new.dtype())?,
+                    None => new.dtype().clone(),
+                }
             },
         };
         self.with_dtype(dtype)
     }
+}
+
+pub(crate) fn args_to_supertype<D: AsRef<DataType>>(dtypes: &[D]) -> PolarsResult<DataType> {
+    let mut st = dtypes[0].as_ref().clone();
+    for dt in &dtypes[1..] {
+        st = try_get_supertype(&st, dt.as_ref())?
+    }
+
+    match (dtypes[0].as_ref(), &st) {
+        #[cfg(feature = "dtype-categorical")]
+        (DataType::Categorical(_, ord), DataType::String) => st = DataType::Categorical(None, *ord),
+        _ => {
+            if let DataType::Unknown(kind) = st {
+                match kind {
+                    UnknownKind::Float => st = DataType::Float64,
+                    UnknownKind::Int(v) => {
+                        st = materialize_dyn_int(v).dtype();
+                    },
+                    UnknownKind::Str => st = DataType::String,
+                    _ => {},
+                }
+            }
+        },
+    }
+
+    Ok(st)
 }

@@ -1,7 +1,7 @@
-use arrow::legacy::kernels::pow::pow as pow_kernel;
-use num::pow::Pow;
-use polars_core::export::num;
-use polars_core::export::num::{Float, ToPrimitive};
+use num_traits::pow::Pow;
+use num_traits::{Float, One, ToPrimitive, Zero};
+use polars_core::prelude::arity::{broadcast_binary_elementwise, unary_elementwise_values};
+use polars_core::with_match_physical_integer_type;
 
 use super::*;
 
@@ -27,170 +27,168 @@ impl Display for PowFunction {
 fn pow_on_chunked_arrays<T, F>(
     base: &ChunkedArray<T>,
     exponent: &ChunkedArray<F>,
-) -> PolarsResult<Option<Series>>
+) -> ChunkedArray<T>
 where
     T: PolarsNumericType,
     F: PolarsNumericType,
-    T::Native: num::pow::Pow<F::Native, Output = T::Native> + ToPrimitive,
-    ChunkedArray<T>: IntoSeries,
+    T::Native: Pow<F::Native, Output = T::Native> + ToPrimitive,
 {
-    if (base.len() == 1) && (exponent.len() != 1) {
-        let base = base
-            .get(0)
-            .ok_or_else(|| polars_err!(ComputeError: "base is null"))?;
-
-        Ok(Some(
-            exponent
-                .apply_values_generic(|exp| Pow::pow(base, exp))
-                .into_series(),
-        ))
-    } else {
-        Ok(Some(
-            polars_core::chunked_array::ops::arity::binary(base, exponent, pow_kernel)
-                .into_series(),
-        ))
+    if exponent.len() == 1 {
+        if let Some(e) = exponent.get(0) {
+            if e == F::Native::zero() {
+                return unary_elementwise_values(base, |_| T::Native::one());
+            }
+            if e == F::Native::one() {
+                return base.clone();
+            }
+            if e == F::Native::one() + F::Native::one() {
+                return base * base;
+            }
+        }
     }
+
+    broadcast_binary_elementwise(base, exponent, |b, e| Some(Pow::pow(b?, e?)))
 }
 
 fn pow_on_floats<T>(
     base: &ChunkedArray<T>,
     exponent: &ChunkedArray<T>,
-) -> PolarsResult<Option<Series>>
+) -> PolarsResult<Option<Column>>
 where
     T: PolarsFloatType,
-    T::Native: num::pow::Pow<T::Native, Output = T::Native> + ToPrimitive + Float,
-    ChunkedArray<T>: IntoSeries,
+    T::Native: Pow<T::Native, Output = T::Native> + ToPrimitive + Float,
+    ChunkedArray<T>: IntoColumn,
 {
     let dtype = T::get_dtype();
 
     if exponent.len() == 1 {
         let Some(exponent_value) = exponent.get(0) else {
-            return Ok(Some(Series::full_null(base.name(), base.len(), &dtype)));
+            return Ok(Some(Column::full_null(
+                base.name().clone(),
+                base.len(),
+                &dtype,
+            )));
         };
         let s = match exponent_value.to_f64().unwrap() {
-            a if a == 1.0 => base.clone().into_series(),
+            1.0 => base.clone().into_column(),
             // specialized sqrt will ensure (-inf)^0.5 = NaN
             // and will likely be faster as well.
-            a if a == 0.5 => base.apply_values(|v| v.sqrt()).into_series(),
+            0.5 => base.apply_values(|v| v.sqrt()).into_column(),
             a if a.fract() == 0.0 && a < 10.0 && a > 1.0 => {
                 let mut out = base.clone();
 
                 for _ in 1..exponent_value.to_u8().unwrap() {
                     out = out * base.clone()
                 }
-                out.into_series()
+                out.into_column()
             },
             _ => base
                 .apply_values(|v| Pow::pow(v, exponent_value))
-                .into_series(),
+                .into_column(),
         };
         Ok(Some(s))
     } else {
-        pow_on_chunked_arrays(base, exponent)
+        Ok(Some(pow_on_chunked_arrays(base, exponent).into_column()))
     }
 }
 
 fn pow_to_uint_dtype<T, F>(
     base: &ChunkedArray<T>,
     exponent: &ChunkedArray<F>,
-) -> PolarsResult<Option<Series>>
+) -> PolarsResult<Option<Column>>
 where
     T: PolarsIntegerType,
     F: PolarsIntegerType,
-    T::Native: num::pow::Pow<F::Native, Output = T::Native> + ToPrimitive,
-    ChunkedArray<T>: IntoSeries,
+    T::Native: Pow<F::Native, Output = T::Native> + ToPrimitive,
+    ChunkedArray<T>: IntoColumn,
 {
     let dtype = T::get_dtype();
 
     if exponent.len() == 1 {
         let Some(exponent_value) = exponent.get(0) else {
-            return Ok(Some(Series::full_null(base.name(), base.len(), &dtype)));
+            return Ok(Some(Column::full_null(
+                base.name().clone(),
+                base.len(),
+                &dtype,
+            )));
         };
         let s = match exponent_value.to_u64().unwrap() {
-            1 => base.clone().into_series(),
+            1 => base.clone().into_column(),
             2..=10 => {
                 let mut out = base.clone();
 
                 for _ in 1..exponent_value.to_u8().unwrap() {
                     out = out * base.clone()
                 }
-                out.into_series()
+                out.into_column()
             },
             _ => base
                 .apply_values(|v| Pow::pow(v, exponent_value))
-                .into_series(),
+                .into_column(),
         };
         Ok(Some(s))
     } else {
-        pow_on_chunked_arrays(base, exponent)
+        Ok(Some(pow_on_chunked_arrays(base, exponent).into_column()))
     }
 }
 
-fn pow_on_series(base: &Series, exponent: &Series) -> PolarsResult<Option<Series>> {
+fn pow_on_series(base: &Column, exponent: &Column) -> PolarsResult<Option<Column>> {
     use DataType::*;
-    match (base.dtype(), exponent.dtype()) {
-        #[cfg(feature = "dtype-u8")]
-        (UInt8, UInt8 | UInt16 | UInt32 | UInt64) => {
-            let ca = base.u8().unwrap();
-            let exponent = exponent.strict_cast(&DataType::UInt32)?;
-            pow_to_uint_dtype(ca, exponent.u32().unwrap())
-        },
-        #[cfg(feature = "dtype-i8")]
-        (Int8, UInt8 | UInt16 | UInt32 | UInt64) => {
-            let ca = base.i8().unwrap();
-            let exponent = exponent.strict_cast(&DataType::UInt32)?;
-            pow_to_uint_dtype(ca, exponent.u32().unwrap())
-        },
-        #[cfg(feature = "dtype-u16")]
-        (UInt16, UInt8 | UInt16 | UInt32 | UInt64) => {
-            let ca = base.u16().unwrap();
-            let exponent = exponent.strict_cast(&DataType::UInt32)?;
-            pow_to_uint_dtype(ca, exponent.u32().unwrap())
-        },
-        #[cfg(feature = "dtype-i16")]
-        (Int16, UInt8 | UInt16 | UInt32 | UInt64) => {
-            let ca = base.i16().unwrap();
-            let exponent = exponent.strict_cast(&DataType::UInt32)?;
-            pow_to_uint_dtype(ca, exponent.u32().unwrap())
-        },
-        (UInt32, UInt8 | UInt16 | UInt32 | UInt64) => {
-            let ca = base.u32().unwrap();
-            let exponent = exponent.strict_cast(&DataType::UInt32)?;
-            pow_to_uint_dtype(ca, exponent.u32().unwrap())
-        },
-        (Int32, UInt8 | UInt16 | UInt32 | UInt64) => {
-            let ca = base.i32().unwrap();
-            let exponent = exponent.strict_cast(&DataType::UInt32)?;
-            pow_to_uint_dtype(ca, exponent.u32().unwrap())
-        },
-        (UInt64, UInt8 | UInt16 | UInt32 | UInt64) => {
-            let ca = base.u64().unwrap();
-            let exponent = exponent.strict_cast(&DataType::UInt32)?;
-            pow_to_uint_dtype(ca, exponent.u32().unwrap())
-        },
-        (Int64, UInt8 | UInt16 | UInt32 | UInt64) => {
-            let ca = base.i64().unwrap();
-            let exponent = exponent.strict_cast(&DataType::UInt32)?;
-            pow_to_uint_dtype(ca, exponent.u32().unwrap())
-        },
-        (Float32, _) => {
-            let ca = base.f32().unwrap();
-            let exponent = exponent.strict_cast(&DataType::Float32)?;
-            pow_on_floats(ca, exponent.f32().unwrap())
-        },
-        (Float64, _) => {
-            let ca = base.f64().unwrap();
-            let exponent = exponent.strict_cast(&DataType::Float64)?;
-            pow_on_floats(ca, exponent.f64().unwrap())
-        },
-        _ => {
-            let base = base.cast(&DataType::Float64)?;
-            pow_on_series(&base, exponent)
-        },
+
+    let base_dtype = base.dtype();
+    polars_ensure!(
+        base_dtype.is_primitive_numeric(),
+        InvalidOperation: "`pow` operation not supported for dtype `{}` as base", base_dtype
+    );
+    let exponent_dtype = exponent.dtype();
+    polars_ensure!(
+        exponent_dtype.is_primitive_numeric(),
+        InvalidOperation: "`pow` operation not supported for dtype `{}` as exponent", exponent_dtype
+    );
+
+    // if false, dtype is float
+    if base_dtype.is_integer() {
+        with_match_physical_integer_type!(base_dtype, |$native_type| {
+            if exponent_dtype.is_float() {
+                match exponent_dtype {
+                    Float32 => {
+                        let ca = base.cast(&DataType::Float32)?;
+                        pow_on_floats(ca.f32().unwrap(), exponent.f32().unwrap())
+                    },
+                    Float64 => {
+                        let ca = base.cast(&DataType::Float64)?;
+                        pow_on_floats(ca.f64().unwrap(), exponent.f64().unwrap())
+                    },
+                    _ => unreachable!(),
+                }
+            } else {
+                let ca = base.$native_type().unwrap();
+                let exponent = exponent.strict_cast(&DataType::UInt32).map_err(|err| polars_err!(
+                    InvalidOperation:
+                    "{}\n\nHint: if you were trying to raise an integer to a negative integer power, please cast your base or exponent to float first.",
+                    err
+                ))?;
+                pow_to_uint_dtype(ca, exponent.u32().unwrap())
+            }
+        })
+    } else {
+        match base_dtype {
+            Float32 => {
+                let ca = base.f32().unwrap();
+                let exponent = exponent.strict_cast(&DataType::Float32)?;
+                pow_on_floats(ca, exponent.f32().unwrap())
+            },
+            Float64 => {
+                let ca = base.f64().unwrap();
+                let exponent = exponent.strict_cast(&DataType::Float64)?;
+                pow_on_floats(ca, exponent.f64().unwrap())
+            },
+            _ => unreachable!(),
+        }
     }
 }
 
-pub(super) fn pow(s: &mut [Series]) -> PolarsResult<Option<Series>> {
+pub(super) fn pow(s: &mut [Column]) -> PolarsResult<Option<Column>> {
     let base = &s[0];
     let exponent = &s[1];
 
@@ -207,7 +205,7 @@ pub(super) fn pow(s: &mut [Series]) -> PolarsResult<Option<Series>> {
     }
 }
 
-pub(super) fn sqrt(base: &Series) -> PolarsResult<Series> {
+pub(super) fn sqrt(base: &Column) -> PolarsResult<Column> {
     use DataType::*;
     match base.dtype() {
         Float32 => {
@@ -225,16 +223,16 @@ pub(super) fn sqrt(base: &Series) -> PolarsResult<Series> {
     }
 }
 
-fn sqrt_on_floats<T>(base: &ChunkedArray<T>) -> PolarsResult<Series>
+fn sqrt_on_floats<T>(base: &ChunkedArray<T>) -> PolarsResult<Column>
 where
     T: PolarsFloatType,
-    T::Native: num::pow::Pow<T::Native, Output = T::Native> + ToPrimitive + Float,
-    ChunkedArray<T>: IntoSeries,
+    T::Native: Pow<T::Native, Output = T::Native> + ToPrimitive + Float,
+    ChunkedArray<T>: IntoColumn,
 {
-    Ok(base.apply_values(|v| v.sqrt()).into_series())
+    Ok(base.apply_values(|v| v.sqrt()).into_column())
 }
 
-pub(super) fn cbrt(base: &Series) -> PolarsResult<Series> {
+pub(super) fn cbrt(base: &Column) -> PolarsResult<Column> {
     use DataType::*;
     match base.dtype() {
         Float32 => {
@@ -252,11 +250,11 @@ pub(super) fn cbrt(base: &Series) -> PolarsResult<Series> {
     }
 }
 
-fn cbrt_on_floats<T>(base: &ChunkedArray<T>) -> PolarsResult<Series>
+fn cbrt_on_floats<T>(base: &ChunkedArray<T>) -> PolarsResult<Column>
 where
     T: PolarsFloatType,
-    T::Native: num::pow::Pow<T::Native, Output = T::Native> + ToPrimitive + Float,
-    ChunkedArray<T>: IntoSeries,
+    T::Native: Pow<T::Native, Output = T::Native> + ToPrimitive + Float,
+    ChunkedArray<T>: IntoColumn,
 {
-    Ok(base.apply_values(|v| v.cbrt()).into_series())
+    Ok(base.apply_values(|v| v.cbrt()).into_column())
 }

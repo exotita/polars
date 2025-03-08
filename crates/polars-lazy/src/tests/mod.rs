@@ -2,20 +2,20 @@ mod aggregations;
 mod arity;
 #[cfg(all(feature = "strings", feature = "cse"))]
 mod cse;
-mod err_msg;
 #[cfg(feature = "parquet")]
 mod io;
 mod logical;
 mod optimization_checks;
+#[cfg(all(feature = "strings", feature = "cse"))]
+mod pdsh;
 mod predicate_queries;
 mod projection_queries;
 mod queries;
+mod schema;
 #[cfg(feature = "streaming")]
 mod streaming;
-#[cfg(all(feature = "strings", feature = "cse"))]
-mod tpch;
 
-fn get_arenas() -> (Arena<AExpr>, Arena<ALogicalPlan>) {
+fn get_arenas() -> (Arena<AExpr>, Arena<IR>) {
     let expr_arena = Arena::with_capacity(16);
     let lp_arena = Arena::with_capacity(8);
     (expr_arena, lp_arena)
@@ -31,18 +31,15 @@ fn load_df() -> DataFrame {
 
 use std::io::Cursor;
 
+#[cfg(feature = "temporal")]
+use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use optimization_checks::*;
 use polars_core::chunked_array::builder::get_list_builder;
 use polars_core::df;
-#[cfg(feature = "temporal")]
-use polars_core::export::chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use polars_core::prelude::*;
 #[cfg(feature = "parquet")]
 pub(crate) use polars_core::SINGLE_LOCK;
 use polars_io::prelude::*;
-use polars_plan::logical_plan::{
-    OptimizationRule, SimplifyExprRule, StackOptimizer, TypeCoercionRule,
-};
 
 #[cfg(feature = "cov")]
 use crate::dsl::pearson_corr;
@@ -51,7 +48,7 @@ use crate::prelude::*;
 #[cfg(feature = "parquet")]
 static GLOB_PARQUET: &str = "../../examples/datasets/*.parquet";
 #[cfg(feature = "csv")]
-static GLOB_CSV: &str = "../../examples/datasets/*.csv";
+static GLOB_CSV: &str = "../../examples/datasets/foods*.csv";
 #[cfg(feature = "ipc")]
 static GLOB_IPC: &str = "../../examples/datasets/*.ipc";
 #[cfg(feature = "parquet")]
@@ -76,6 +73,16 @@ fn scan_foods_ipc() -> LazyFrame {
 
 #[cfg(any(feature = "ipc", feature = "parquet"))]
 fn init_files() {
+    if std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open("../../examples/datasets/busy")
+        .is_err()
+    {
+        while !std::fs::exists("../../examples/datasets/finished").unwrap() {}
+        return;
+    }
+
     for path in &[
         "../../examples/datasets/foods1.csv",
         "../../examples/datasets/foods2.csv",
@@ -85,7 +92,11 @@ fn init_files() {
             let out_path = path.replace(".csv", ext);
 
             if std::fs::metadata(&out_path).is_err() {
-                let mut df = CsvReader::from_path(path).unwrap().finish().unwrap();
+                let mut df = CsvReadOptions::default()
+                    .try_into_reader_with_file_path(Some(path.into()))
+                    .unwrap()
+                    .finish()
+                    .unwrap();
                 let f = std::fs::File::create(&out_path).unwrap();
 
                 match ext {
@@ -93,7 +104,7 @@ fn init_files() {
                         #[cfg(feature = "parquet")]
                         {
                             ParquetWriter::new(f)
-                                .with_statistics(true)
+                                .with_statistics(StatisticsOptions::full())
                                 .finish(&mut df)
                                 .unwrap();
                         }
@@ -112,6 +123,12 @@ fn init_files() {
             }
         }
     }
+
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open("../../examples/datasets/finished")
+        .unwrap();
 }
 
 #[cfg(feature = "parquet")]
@@ -166,7 +183,7 @@ pub(crate) fn fruits_cars() -> DataFrame {
 
 pub(crate) fn get_df() -> DataFrame {
     let s = r#"
-"sepal.length","sepal.width","petal.length","petal.width","variety"
+"sepal_length","sepal_width","petal_length","petal_width","variety"
 5.1,3.5,1.4,.2,"Setosa"
 4.9,3,1.4,.2,"Setosa"
 4.7,3.2,1.3,.2,"Setosa"
@@ -178,11 +195,10 @@ pub(crate) fn get_df() -> DataFrame {
 
     let file = Cursor::new(s);
 
-    let df = CsvReader::new(file)
-        // we also check if infer schema ignores errors
-        .infer_schema(Some(3))
-        .has_header(true)
+    CsvReadOptions::default()
+        .with_infer_schema_length(Some(3))
+        .with_has_header(true)
+        .into_reader_with_file_handle(file)
         .finish()
-        .unwrap();
-    df
+        .unwrap()
 }

@@ -106,7 +106,13 @@ pub(super) fn push_operators_single_thread(
                 let op = op.get_mut();
                 match op.execute(ec, &chunk)? {
                     OperatorResult::Finished(chunk) => {
-                        must_flush.store(op.must_flush(), Ordering::Relaxed);
+                        let flag = op.must_flush();
+                        let _ = must_flush.compare_exchange(
+                            false,
+                            flag,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        );
                         in_process.push((op_i + 1, chunk))
                     },
                     OperatorResult::HaveMoreOutPut(output_chunk) => {
@@ -214,7 +220,7 @@ pub(super) fn flush_operators(
                         }
                     },
                     // The branch for pushing data in the operators.
-                    // This is the same as the default stack exectuor, except now it pushes
+                    // This is the same as the default stack executor, except now it pushes
                     // `Some(chunk)` instead of `chunk`.
                     Some(chunk) => {
                         match operators.get_mut(op_i) {

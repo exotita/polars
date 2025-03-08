@@ -7,13 +7,14 @@ use std::sync::{Arc, Mutex};
 use polars_core::error::PolarsResult;
 use polars_core::utils::accumulate_dataframes_vertical_unchecked;
 use polars_core::POOL;
+use polars_expr::state::ExecutionState;
 use polars_utils::sync::SyncPtr;
 use rayon::prelude::*;
 
 use crate::executors::sources::DataFrameSource;
 use crate::operators::{
-    DataChunk, FinalizedSink, OperatorResult, PExecutionContext, SExecutionContext, Sink,
-    SinkResult, Source, SourceResult,
+    DataChunk, FinalizedSink, OperatorResult, PExecutionContext, Sink, SinkResult, Source,
+    SourceResult,
 };
 use crate::pipeline::dispatcher::drive_operator::{par_flush, par_process_chunks};
 mod drive_operator;
@@ -51,56 +52,56 @@ impl ThreadedSink {
     }
 }
 
-/// A pipeline consists of:
-///
-/// - 1. One or more sources.
-///         Sources get pulled and their data is pushed into operators.
-/// - 2. Zero or more operators.
-///         The operators simply pass through data, modifying it as they need.
-///         Operators can work on batches and don't need all data in scope to
-///         succeed.
-///         Think for example on multiply a few columns, or applying a predicate.
-///         Operators can shrink the batches: filter
-///         Grow the batches: explode/ melt
-///         Keep them the same size: element-wise operations
-///         The probe side of join operations is also an operator.
-///
-///
-/// - 3. One or more sinks
-///         A sink needs all data in scope to finalize a pipeline branch.
-///         Think of sorts, preparing a build phase of a join, group_by + aggregations.
-///
-/// This struct will have the SOS (source, operators, sinks) of its own pipeline branch, but also
-/// the SOS of other branches. The SOS are stored data oriented and the sinks have an offset that
-/// indicates the last operator node before that specific sink. We only store the `end offset` and
-/// keep track of the starting operator during execution.
-///
-/// Pipelines branches are shared with other pipeline branches at the join/union nodes.
-/// # JOIN
-/// Consider this tree:
-///         out
-///       /
-///     /\
-///    1  2
-///
-/// And let's consider that branch 2 runs first. It will run until the join node where it will sink
-/// into a build table. Once that is done it will replace the build-phase placeholder operator in
-/// branch 1. Branch one can then run completely until out.
+// A pipeline consists of:
+//
+// - 1. One or more sources.
+//         Sources get pulled and their data is pushed into operators.
+// - 2. Zero or more operators.
+//         The operators simply pass through data, modifying it as they need.
+//         Operators can work on batches and don't need all data in scope to
+//         succeed.
+//         Think for example on multiply a few columns, or applying a predicate.
+//         Operators can shrink the batches: filter
+//         Grow the batches: explode/ unpivot
+//         Keep them the same size: element-wise operations
+//         The probe side of join operations is also an operator.
+//
+//
+// - 3. One or more sinks
+//         A sink needs all data in scope to finalize a pipeline branch.
+//         Think of sorts, preparing a build phase of a join, group_by + aggregations.
+//
+// This struct will have the SOS (source, operators, sinks) of its own pipeline branch, but also
+// the SOS of other branches. The SOS are stored data oriented and the sinks have an offset that
+// indicates the last operator node before that specific sink. We only store the `end offset` and
+// keep track of the starting operator during execution.
+//
+// Pipelines branches are shared with other pipeline branches at the join/union nodes.
+// # JOIN
+// Consider this tree:
+//         out
+//       /
+//     /\
+//    1  2
+//
+// And let's consider that branch 2 runs first. It will run until the join node where it will sink
+// into a build table. Once that is done it will replace the build-phase placeholder operator in
+// branch 1. Branch one can then run completely until out.
 pub struct PipeLine {
-    /// All the sources of this pipeline
+    // All the sources of this pipeline
     sources: Vec<Box<dyn Source>>,
-    /// All the operators of this pipeline. Some may be placeholders that will be replaced during
-    /// execution
+    // All the operators of this pipeline. Some may be placeholders that will be replaced during
+    // execution
     operators: Vec<ThreadedOperator>,
-    /// - offset in the operators vec
-    ///   at that point the sink should be called.
-    ///   the pipeline will first call the operators on that point and then
-    ///   push the result in the sink.
-    /// - shared_count
-    ///     when that hits 0, the sink will finalize
-    /// - node of the sink
+    // - offset in the operators vec
+    //   at that point the sink should be called.
+    //   the pipeline will first call the operators on that point and then
+    //   push the result in the sink.
+    // - shared_count
+    //     when that hits 0, the sink will finalize
+    // - node of the sink
     sinks: Vec<ThreadedSink>,
-    /// Log runtime info to stderr
+    // Log runtime info to stderr
     verbose: bool,
 }
 
@@ -303,14 +304,16 @@ impl PipeLine {
     ) -> PolarsResult<Option<FinalizedSink>> {
         let (sink_shared_count, mut reduced_sink) = self.run_pipeline_no_finalize(ec, pipelines)?;
         assert_eq!(sink_shared_count, 0);
-        Ok(reduced_sink.finalize(ec).ok())
+
+        let finalized_reduced_sink = reduced_sink.finalize(ec)?;
+        Ok(Some(finalized_reduced_sink))
     }
 }
 
 /// Executes all branches and replaces operators and sinks during execution to ensure
 /// we materialize.
 pub fn execute_pipeline(
-    state: Box<dyn SExecutionContext>,
+    state: ExecutionState,
     mut pipelines: Vec<PipeLine>,
 ) -> PolarsResult<DataFrame> {
     let mut pipeline = pipelines.pop().unwrap();

@@ -6,10 +6,10 @@ use super::*;
 #[test]
 #[cfg(feature = "dtype-datetime")]
 fn test_agg_list_type() -> PolarsResult<()> {
-    let s = Series::new("foo", &[1, 2, 3]);
+    let s = Series::new("foo".into(), &[1, 2, 3]);
     let s = s.cast(&DataType::Datetime(TimeUnit::Nanoseconds, None))?;
 
-    let l = unsafe { s.agg_list(&GroupsProxy::Idx(vec![(0, unitvec![0, 1, 2])].into())) };
+    let l = unsafe { s.agg_list(&GroupsType::Idx(vec![(0, unitvec![0, 1, 2])].into())) };
 
     let result = match l.dtype() {
         DataType::List(inner) => {
@@ -53,18 +53,22 @@ fn test_agg_unique_first() -> PolarsResult<()> {
         .group_by_stable([col("g")])
         .agg([
             col("v").unique().first().alias("v_first"),
-            col("v").unique().sort(false).first().alias("true_first"),
+            col("v")
+                .unique()
+                .sort(Default::default())
+                .first()
+                .alias("true_first"),
             col("v").unique().implode(),
         ])
         .collect()?;
 
     let a = out.column("v_first").unwrap();
-    let a = a.sum::<i32>().unwrap();
+    let a = a.as_materialized_series().sum::<i32>().unwrap();
     // can be both because unique does not guarantee order
     assert!(a == 10 || a == 11);
 
     let a = out.column("true_first").unwrap();
-    let a = a.sum::<i32>().unwrap();
+    let a = a.as_materialized_series().sum::<i32>().unwrap();
     // can be both because unique does not guarantee order
     assert_eq!(a, 10);
 
@@ -87,7 +91,7 @@ fn test_cum_sum_agg_as_key() -> PolarsResult<()> {
             .cum_sum(false)
             .alias("key")])
         .agg([col("depth").max().name().keep()])
-        .sort("depth", SortOptions::default())
+        .sort(["depth"], Default::default())
         .collect()?;
 
     assert_eq!(
@@ -169,25 +173,22 @@ fn test_power_in_agg_list1() -> PolarsResult<()> {
         .group_by([col("fruits")])
         .agg([
             col("A")
-                .rolling_min(RollingOptions {
-                    window_size: Duration::new(1),
+                .rolling_min(RollingOptionsFixedWindow {
+                    window_size: 1,
                     ..Default::default()
                 })
                 .alias("input"),
             col("A")
-                .rolling_min(RollingOptions {
-                    window_size: Duration::new(1),
+                .rolling_min(RollingOptionsFixedWindow {
+                    window_size: 1,
                     ..Default::default()
                 })
                 .pow(2.0)
                 .alias("foo"),
         ])
         .sort(
-            "fruits",
-            SortOptions {
-                descending: true,
-                ..Default::default()
-            },
+            ["fruits"],
+            SortMultipleOptions::default().with_order_descending(true),
         )
         .collect()?;
 
@@ -210,8 +211,8 @@ fn test_power_in_agg_list2() -> PolarsResult<()> {
         .lazy()
         .group_by([col("fruits")])
         .agg([col("A")
-            .rolling_min(RollingOptions {
-                window_size: Duration::new(2),
+            .rolling_min(RollingOptionsFixedWindow {
+                window_size: 2,
                 min_periods: 2,
                 ..Default::default()
             })
@@ -219,11 +220,8 @@ fn test_power_in_agg_list2() -> PolarsResult<()> {
             .sum()
             .alias("foo")])
         .sort(
-            "fruits",
-            SortOptions {
-                descending: true,
-                ..Default::default()
-            },
+            ["fruits"],
+            SortMultipleOptions::default().with_order_descending(true),
         )
         .collect()?;
 
@@ -402,7 +400,7 @@ fn test_shift_elementwise_issue_2509() -> PolarsResult<()> {
         // Don't use maintain order here! That hides the bug
         .group_by([col("x")])
         .agg(&[(col("y").shift(lit(-1)) + col("x")).alias("sum")])
-        .sort("x", Default::default())
+        .sort(["x"], Default::default())
         .collect()?;
 
     let out = out.explode(["sum"])?;
@@ -430,7 +428,7 @@ fn take_aggregations() -> PolarsResult<()> {
         .lazy()
         .group_by([col("user")])
         .agg([col("book").get(col("count").arg_max()).alias("fav_book")])
-        .sort("user", Default::default())
+        .sort(["user"], Default::default())
         .collect()?;
 
     let s = out.column("fav_book")?;
@@ -452,12 +450,13 @@ fn take_aggregations() -> PolarsResult<()> {
                             nulls_last: false,
                             multithreaded: true,
                             maintain_order: false,
+                            limit: None,
                         })
                         .head(Some(2)),
                 )
                 .alias("ordered"),
         ])
-        .sort("user", Default::default())
+        .sort(["user"], Default::default())
         .collect()?;
     let s = out.column("ordered")?;
     let flat = s.explode()?;
@@ -469,7 +468,7 @@ fn take_aggregations() -> PolarsResult<()> {
         .lazy()
         .group_by([col("user")])
         .agg([col("book").get(lit(0)).alias("take_lit")])
-        .sort("user", Default::default())
+        .sort(["user"], Default::default())
         .collect()?;
 
     let taken = out.column("take_lit")?;
@@ -482,40 +481,42 @@ fn take_aggregations() -> PolarsResult<()> {
 #[test]
 fn test_take_consistency() -> PolarsResult<()> {
     let df = fruits_cars();
-    // let out = df
-    //     .clone()
-    //     .lazy()
-    //     .select([col("A")
-    //         .arg_sort(SortOptions {
-    //             descending: true,
-    //             nulls_last: false,
-    //             multithreaded: true,
-    //             maintain_order: false,
-    //         })
-    //         .get(lit(0))])
-    //     .collect()?;
-    //
-    // let a = out.column("A")?;
-    // let a = a.idx()?;
-    // assert_eq!(a.get(0), Some(4));
-    //
-    // let out = df
-    //     .clone()
-    //     .lazy()
-    //     .group_by_stable([col("cars")])
-    //     .agg([col("A")
-    //         .arg_sort(SortOptions {
-    //             descending: true,
-    //             nulls_last: false,
-    //             multithreaded: true,
-    //             maintain_order: false,
-    //         })
-    //         .get(lit(0))])
-    //     .collect()?;
-    //
-    // let out = out.column("A")?;
-    // let out = out.idx()?;
-    // assert_eq!(Vec::from(out), &[Some(3), Some(0)]);
+    let out = df
+        .clone()
+        .lazy()
+        .select([col("A")
+            .arg_sort(SortOptions {
+                descending: true,
+                nulls_last: false,
+                multithreaded: true,
+                maintain_order: false,
+                limit: None,
+            })
+            .get(lit(0))])
+        .collect()?;
+
+    let a = out.column("A")?;
+    let a = a.idx()?;
+    assert_eq!(a.get(0), Some(4));
+
+    let out = df
+        .clone()
+        .lazy()
+        .group_by_stable([col("cars")])
+        .agg([col("A")
+            .arg_sort(SortOptions {
+                descending: true,
+                nulls_last: false,
+                multithreaded: true,
+                maintain_order: false,
+                limit: None,
+            })
+            .get(lit(0))])
+        .collect()?;
+
+    let out = out.column("A")?;
+    let out = out.idx()?;
+    assert_eq!(Vec::from(out), &[Some(3), Some(0)]);
 
     let out_df = df
         .lazy()
@@ -528,6 +529,7 @@ fn test_take_consistency() -> PolarsResult<()> {
                     nulls_last: false,
                     multithreaded: true,
                     maintain_order: false,
+                    limit: None,
                 })
                 .get(lit(0))
                 .alias("1"),
@@ -539,6 +541,7 @@ fn test_take_consistency() -> PolarsResult<()> {
                             nulls_last: false,
                             multithreaded: true,
                             maintain_order: false,
+                            limit: None,
                         })
                         .get(lit(0)),
                 )
@@ -563,7 +566,7 @@ fn test_take_in_groups() -> PolarsResult<()> {
 
     let out = df
         .lazy()
-        .sort("fruits", Default::default())
+        .sort(["fruits"], Default::default())
         .select([col("B").get(lit(0u32)).over([col("fruits")]).alias("taken")])
         .collect()?;
 
@@ -572,4 +575,43 @@ fn test_take_in_groups() -> PolarsResult<()> {
         &[Some(3), Some(3), Some(5), Some(5), Some(5)]
     );
     Ok(())
+}
+
+#[test]
+fn test_anonymous_function_returns_scalar_all_null_20679() {
+    use std::sync::Arc;
+
+    fn reduction_function(column: Column) -> PolarsResult<Option<Column>> {
+        let val = column.get(0)?.into_static();
+        let col = Column::new_scalar("".into(), Scalar::new(column.dtype().clone(), val), 1);
+        Ok(Some(col))
+    }
+
+    let a = Column::new("a".into(), &[0, 0, 1]);
+    let dtype = DataType::Null;
+    let b = Column::new_scalar("b".into(), Scalar::new(dtype, AnyValue::Null), 3);
+    let df = DataFrame::new(vec![a, b]).unwrap();
+
+    let f = move |c: &mut [Column]| reduction_function(std::mem::take(&mut c[0]));
+
+    let expr = Expr::AnonymousFunction {
+        input: vec![col("b")],
+        function: LazySerde::Deserialized(SpecialEq::new(Arc::new(f))),
+        output_type: Default::default(),
+        options: FunctionOptions {
+            collect_groups: ApplyOptions::GroupWise,
+            fmt_str: "",
+            flags: FunctionFlags::default() | FunctionFlags::RETURNS_SCALAR,
+            ..Default::default()
+        },
+    };
+
+    let grouped_df = df
+        .lazy()
+        .group_by([col("a")])
+        .agg([expr])
+        .collect()
+        .unwrap();
+
+    assert_eq!(grouped_df.get_columns()[1].dtype(), &DataType::Null);
 }

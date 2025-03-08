@@ -10,7 +10,7 @@ from polars.testing import assert_frame_equal
 pytestmark = pytest.mark.xdist_group("streaming")
 
 
-def test_cse_expr_selection_streaming(monkeypatch: Any, capfd: Any) -> None:
+def test_cse_expr_selection_streaming(monkeypatch: Any) -> None:
     monkeypatch.setenv("POLARS_VERBOSE", "1")
     q = pl.LazyFrame(
         {
@@ -29,13 +29,15 @@ def test_cse_expr_selection_streaming(monkeypatch: Any, capfd: Any) -> None:
         (derived2 * 10).alias("d3"),
     ]
 
-    result = q.select(exprs).collect(comm_subexpr_elim=True, streaming=True)
+    result = q.select(exprs).collect(comm_subexpr_elim=True, engine="old-streaming")
     expected = pl.DataFrame(
         {"d1": [1, 4, 9, 16], "d2": [1, 16, 81, 256], "d3": [10, 160, 810, 2560]}
     )
     assert_frame_equal(result, expected)
 
-    result = q.with_columns(exprs).collect(comm_subexpr_elim=True, streaming=True)
+    result = q.with_columns(exprs).collect(
+        comm_subexpr_elim=True, engine="old-streaming"
+    )
     expected = pl.DataFrame(
         {
             "a": [1, 2, 3, 4],
@@ -48,12 +50,7 @@ def test_cse_expr_selection_streaming(monkeypatch: Any, capfd: Any) -> None:
     )
     assert_frame_equal(result, expected)
 
-    err = capfd.readouterr().err
-    assert "df -> projection[cse] -> ordered_sink" in err
-    assert "df -> hstack[cse] -> ordered_sink" in err
 
-
-@pytest.mark.skip(reason="activate once fixed")
 def test_cse_expr_group_by() -> None:
     q = pl.LazyFrame(
         {
@@ -74,16 +71,18 @@ def test_cse_expr_group_by() -> None:
     assert "__POLARS_CSER" in q.explain(comm_subexpr_elim=True, optimized=True)
 
     s = q.explain(
-        comm_subexpr_elim=True, optimized=True, streaming=True, comm_subplan_elim=False
+        comm_subexpr_elim=True,
+        optimized=True,
+        engine="old-streaming",
+        comm_subplan_elim=False,
     )
-    # check if it uses CSE_expr
-    # and is a complete pipeline
-    assert "__POLARS_CSER" in s
-    assert s.startswith("--- STREAMING")
+    assert s.startswith("STREAMING")
 
     expected = pl.DataFrame(
         {"a": [1, 2, 3, 4], "sum": [1, 4, 9, 16], "min": [1, 4, 9, 16]}
     )
     for streaming in [True, False]:
-        out = q.collect(comm_subexpr_elim=True, streaming=streaming)
+        out = q.collect(
+            comm_subexpr_elim=True, engine="old-streaming" if streaming else "in-memory"
+        )
         assert_frame_equal(out, expected)

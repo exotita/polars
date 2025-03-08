@@ -20,6 +20,15 @@ pub fn _merge_sorted_dfs(
         ComputeError: "merge-sort datatype mismatch: {} != {}", dtype_lhs, dtype_rhs
     );
 
+    if dtype_lhs.is_categorical() {
+        let rev_map_lhs = left_s.categorical().unwrap().get_rev_map();
+        let rev_map_rhs = right_s.categorical().unwrap().get_rev_map();
+        polars_ensure!(
+            rev_map_lhs.same_src(rev_map_rhs),
+            ComputeError: "can only merge-sort categoricals with the same categories"
+        );
+    }
+
     // If one frame is empty, we can return the other immediately.
     if right_s.is_empty() {
         return Ok(left.clone());
@@ -27,7 +36,7 @@ pub fn _merge_sorted_dfs(
         return Ok(right.clone());
     }
 
-    let merge_indicator = series_to_merge_indicator(left_s, right_s);
+    let merge_indicator = series_to_merge_indicator(left_s, right_s)?;
     let new_columns = left
         .get_columns()
         .iter()
@@ -36,19 +45,23 @@ pub fn _merge_sorted_dfs(
             let lhs_phys = lhs.to_physical_repr();
             let rhs_phys = rhs.to_physical_repr();
 
-            let out = merge_series(&lhs_phys, &rhs_phys, &merge_indicator);
-            let mut out = out.cast(lhs.dtype()).unwrap();
-            out.rename(lhs.name());
-            out
+            let out = Column::from(merge_series(
+                lhs_phys.as_materialized_series(),
+                rhs_phys.as_materialized_series(),
+                &merge_indicator,
+            )?);
+            let mut out = unsafe { out.from_physical_unchecked(lhs.dtype()) }.unwrap();
+            out.rename(lhs.name().clone());
+            Ok(out)
         })
-        .collect();
+        .collect::<PolarsResult<_>>()?;
 
-    Ok(unsafe { DataFrame::new_no_checks(new_columns) })
+    Ok(unsafe { DataFrame::new_no_checks(left.height() + right.height(), new_columns) })
 }
 
-fn merge_series(lhs: &Series, rhs: &Series, merge_indicator: &[bool]) -> Series {
+fn merge_series(lhs: &Series, rhs: &Series, merge_indicator: &[bool]) -> PolarsResult<Series> {
     use DataType::*;
-    match lhs.dtype() {
+    let out = match lhs.dtype() {
         Boolean => {
             let lhs = lhs.bool().unwrap();
             let rhs = rhs.bool().unwrap();
@@ -57,12 +70,10 @@ fn merge_series(lhs: &Series, rhs: &Series, merge_indicator: &[bool]) -> Series 
         },
         String => {
             // dispatch via binary
-            let lhs = lhs.cast(&Binary).unwrap();
-            let rhs = rhs.cast(&Binary).unwrap();
-            let lhs = lhs.binary().unwrap();
-            let rhs = rhs.binary().unwrap();
-            let out = merge_ca(lhs, rhs, merge_indicator);
-            unsafe { out.cast_unchecked(&String).unwrap() }
+            let lhs = lhs.str().unwrap().as_binary();
+            let rhs = rhs.str().unwrap().as_binary();
+            let out = merge_ca(&lhs, &rhs, merge_indicator);
+            unsafe { out.to_string_unchecked() }.into_series()
         },
         Binary => {
             let lhs = lhs.binary().unwrap();
@@ -73,14 +84,20 @@ fn merge_series(lhs: &Series, rhs: &Series, merge_indicator: &[bool]) -> Series 
         Struct(_) => {
             let lhs = lhs.struct_().unwrap();
             let rhs = rhs.struct_().unwrap();
+            polars_ensure!(lhs.null_count() + rhs.null_count() == 0, InvalidOperation: "merge sorted with structs with outer nulls not yet supported");
 
             let new_fields = lhs
-                .fields()
+                .fields_as_series()
                 .iter()
-                .zip(rhs.fields())
-                .map(|(lhs, rhs)| merge_series(lhs, rhs, merge_indicator))
-                .collect::<Vec<_>>();
-            StructChunked::new("", &new_fields).unwrap().into_series()
+                .zip(rhs.fields_as_series())
+                .map(|(lhs, rhs)| {
+                    merge_series(lhs, &rhs, merge_indicator)
+                        .map(|merged| merged.with_name(lhs.name().clone()))
+                })
+                .collect::<PolarsResult<Vec<_>>>()?;
+            StructChunked::from_series(PlSmallStr::EMPTY, new_fields[0].len(), new_fields.iter())
+                .unwrap()
+                .into_series()
         },
         List(_) => {
             let lhs = lhs.list().unwrap();
@@ -94,7 +111,8 @@ fn merge_series(lhs: &Series, rhs: &Series, merge_indicator: &[bool]) -> Series 
                     merge_ca(lhs, rhs, merge_indicator).into_series()
             })
         },
-    }
+    };
+    Ok(out)
 }
 
 fn merge_ca<'a, T>(
@@ -124,20 +142,40 @@ where
     unsafe { iter.trust_my_length(total_len).collect_trusted() }
 }
 
-fn series_to_merge_indicator(lhs: &Series, rhs: &Series) -> Vec<bool> {
+fn series_to_merge_indicator(lhs: &Series, rhs: &Series) -> PolarsResult<Vec<bool>> {
+    if lhs.dtype().is_categorical() {
+        let lhs_ca = lhs.categorical().unwrap();
+        if lhs_ca.uses_lexical_ordering() {
+            let rhs_ca = rhs.categorical().unwrap();
+            let out = get_merge_indicator(lhs_ca.iter_str(), rhs_ca.iter_str());
+            return Ok(out);
+        }
+    }
+
     let lhs_s = lhs.to_physical_repr().into_owned();
     let rhs_s = rhs.to_physical_repr().into_owned();
 
-    match lhs_s.dtype() {
+    let out = match lhs_s.dtype() {
         DataType::Boolean => {
             let lhs = lhs_s.bool().unwrap();
             let rhs = rhs_s.bool().unwrap();
             get_merge_indicator(lhs.into_iter(), rhs.into_iter())
         },
         DataType::String => {
-            let lhs = lhs_s.str().unwrap();
-            let rhs = rhs_s.str().unwrap();
-
+            let lhs = lhs.str().unwrap().as_binary();
+            let rhs = rhs.str().unwrap().as_binary();
+            get_merge_indicator(lhs.into_iter(), rhs.into_iter())
+        },
+        DataType::Binary => {
+            let lhs = lhs_s.binary().unwrap();
+            let rhs = rhs_s.binary().unwrap();
+            get_merge_indicator(lhs.into_iter(), rhs.into_iter())
+        },
+        #[cfg(feature = "dtype-struct")]
+        DataType::Struct(_) => {
+            let options = SortOptions::default();
+            let lhs = lhs_s.struct_().unwrap().get_row_encoded(options)?;
+            let rhs = rhs_s.struct_().unwrap().get_row_encoded(options)?;
             get_merge_indicator(lhs.into_iter(), rhs.into_iter())
         },
         _ => {
@@ -149,7 +187,8 @@ fn series_to_merge_indicator(lhs: &Series, rhs: &Series) -> Vec<bool> {
 
             })
         },
-    }
+    };
+    Ok(out)
 }
 
 // get a boolean values, left: true, right: false
@@ -199,7 +238,7 @@ where
             }
             // b is depleted fill with a indicator
             let remaining = cap - out.len();
-            out.extend(std::iter::repeat(A_INDICATOR).take(remaining));
+            out.extend(std::iter::repeat_n(A_INDICATOR, remaining));
             return out;
         }
     }

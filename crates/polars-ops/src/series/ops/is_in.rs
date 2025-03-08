@@ -1,15 +1,17 @@
 use std::hash::Hash;
 
+use polars_core::prelude::arity::{unary_elementwise, unary_elementwise_values};
 use polars_core::prelude::*;
 use polars_core::utils::{try_get_supertype, CustomIterTools};
 use polars_core::with_match_physical_numeric_polars_type;
 #[cfg(feature = "dtype-categorical")]
-use polars_utils::iter::EnumerateIdxTrait;
+use polars_utils::itertools::Itertools;
 use polars_utils::total_ord::{ToTotalOrd, TotalEq, TotalHash};
 
 fn is_in_helper_ca<'a, T>(
     ca: &'a ChunkedArray<T>,
     other: &'a ChunkedArray<T>,
+    nulls_equal: bool,
 ) -> PolarsResult<BooleanChunked>
 where
     T: PolarsDataType,
@@ -24,19 +26,39 @@ where
             }
         })
     });
-    Ok(ca
-        .apply_values_generic(|val| set.contains(&val.to_total_ord()))
-        .with_name(ca.name()))
+
+    if nulls_equal {
+        if other.has_nulls() {
+            // If the rhs has nulls, then nulls in the left set evaluates to true.
+            Ok(unary_elementwise(ca, |val| {
+                val.is_none_or(|v| set.contains(&v.to_total_ord()))
+            }))
+        } else {
+            // The rhs has no nulls; nulls in the left evaluates to false.
+            Ok(unary_elementwise(ca, |val| {
+                val.is_some_and(|v| set.contains(&v.to_total_ord()))
+            }))
+        }
+    } else {
+        Ok(
+            unary_elementwise_values(ca, |v| set.contains(&v.to_total_ord()))
+                .with_name(ca.name().clone()),
+        )
+    }
 }
 
-fn is_in_helper<'a, T>(ca: &'a ChunkedArray<T>, other: &Series) -> PolarsResult<BooleanChunked>
+fn is_in_helper<'a, T>(
+    ca: &'a ChunkedArray<T>,
+    other: &'a Series,
+    nulls_equal: bool,
+) -> PolarsResult<BooleanChunked>
 where
     T: PolarsDataType,
     T::Physical<'a>: TotalHash + TotalEq + Copy + ToTotalOrd,
     <T::Physical<'a> as ToTotalOrd>::TotalOrdItem: Hash + Eq + Copy,
 {
     let other = ca.unpack_series_matching_type(other)?;
-    is_in_helper_ca(ca, other)
+    is_in_helper_ca(ca, other, nulls_equal)
 }
 
 fn is_in_numeric_list<T>(ca_in: &ChunkedArray<T>, other: &Series) -> PolarsResult<BooleanChunked>
@@ -46,7 +68,6 @@ where
 {
     let mut ca: BooleanChunked = if ca_in.len() == 1 && other.len() != 1 {
         let value = ca_in.get(0);
-
         other.list()?.apply_amortized_generic(|opt_s| {
             Some(
                 opt_s.map(|s| {
@@ -57,8 +78,7 @@ where
         })
     } else {
         polars_ensure!(ca_in.len() == other.len(), ComputeError: "shapes don't match: expected {} elements in 'is_in' comparison, got {}", ca_in.len(), other.len());
-        // SAFETY: unstable series never lives longer than the iterator.
-        unsafe {
+        {
             ca_in
                 .iter()
                 .zip(other.list()?.amortized_iter())
@@ -72,7 +92,7 @@ where
                 .collect_trusted()
         }
     };
-    ca.rename(ca_in.name());
+    ca.rename(ca_in.name().clone());
     Ok(ca)
 }
 
@@ -107,11 +127,15 @@ where
             })
             .collect_trusted()
     };
-    ca.rename(ca_in.name());
+    ca.rename(ca_in.name().clone());
     Ok(ca)
 }
 
-fn is_in_numeric<T>(ca_in: &ChunkedArray<T>, other: &Series) -> PolarsResult<BooleanChunked>
+fn is_in_numeric<T>(
+    ca_in: &ChunkedArray<T>,
+    other: &Series,
+    nulls_equal: bool,
+) -> PolarsResult<BooleanChunked>
 where
     T: PolarsNumericType,
     T::Native: TotalHash + TotalEq + ToTotalOrd,
@@ -124,7 +148,7 @@ where
             if &st != ca_in.dtype() || **dt != st {
                 let left = ca_in.cast(&st)?;
                 let right = other.cast(&DataType::List(Box::new(st)))?;
-                return is_in(&left, &right);
+                return is_in(&left, &right, nulls_equal);
             };
             is_in_numeric_list(ca_in, other)
         },
@@ -134,7 +158,7 @@ where
             if &st != ca_in.dtype() || **dt != st {
                 let left = ca_in.cast(&st)?;
                 let right = other.cast(&DataType::Array(Box::new(st), *width))?;
-                return is_in(&left, &right);
+                return is_in(&left, &right, nulls_equal);
             };
             is_in_numeric_array(ca_in, other)
         },
@@ -144,9 +168,9 @@ where
                 let st = try_get_supertype(ca_in.dtype(), other.dtype())?;
                 let left = ca_in.cast(&st)?;
                 let right = other.cast(&st)?;
-                return is_in(&left, &right);
+                return is_in(&left, &right, nulls_equal);
             }
-            is_in_helper(ca_in, other)
+            is_in_helper(ca_in, other, nulls_equal)
         },
     }
 }
@@ -182,8 +206,7 @@ fn is_in_string_list_categorical(
         }
     } else {
         polars_ensure!(ca_in.len() == other.len(), ComputeError: "shapes don't match: expected {} elements in 'is_in' comparison, got {}", ca_in.len(), other.len());
-        // SAFETY: unstable series never lives longer than the iterator.
-        unsafe {
+        {
             ca_in
                 .iter()
                 .zip(other.list()?.amortized_iter())
@@ -201,11 +224,15 @@ fn is_in_string_list_categorical(
                 .collect()
         }
     };
-    ca.rename(ca_in.name());
+    ca.rename(ca_in.name().clone());
     Ok(ca)
 }
 
-fn is_in_string(ca_in: &StringChunked, other: &Series) -> PolarsResult<BooleanChunked> {
+fn is_in_string(
+    ca_in: &StringChunked,
+    other: &Series,
+    nulls_equal: bool,
+) -> PolarsResult<BooleanChunked> {
     match other.dtype() {
         #[cfg(feature = "dtype-categorical")]
         DataType::List(dt)
@@ -223,6 +250,7 @@ fn is_in_string(ca_in: &StringChunked, other: &Series) -> PolarsResult<BooleanCh
             &other
                 .cast(&DataType::List(Box::new(DataType::Binary)))
                 .unwrap(),
+            nulls_equal,
         ),
         #[cfg(feature = "dtype-array")]
         DataType::Array(dt, width) if DataType::String == **dt => is_in_binary(
@@ -230,13 +258,16 @@ fn is_in_string(ca_in: &StringChunked, other: &Series) -> PolarsResult<BooleanCh
             &other
                 .cast(&DataType::Array(Box::new(DataType::Binary), *width))
                 .unwrap(),
+            nulls_equal,
         ),
-        DataType::String => {
-            is_in_binary(&ca_in.as_binary(), &other.cast(&DataType::Binary).unwrap())
-        },
+        DataType::String => is_in_binary(
+            &ca_in.as_binary(),
+            &other.cast(&DataType::Binary).unwrap(),
+            nulls_equal,
+        ),
         #[cfg(feature = "dtype-categorical")]
         DataType::Enum(_, _) | DataType::Categorical(_, _) => {
-            is_in_string_categorical(ca_in, other.categorical().unwrap())
+            is_in_string_categorical(ca_in, other.categorical().unwrap(), nulls_equal)
         },
         _ => polars_bail!(opq = is_in, ca_in.dtype(), other.dtype()),
     }
@@ -256,8 +287,7 @@ fn is_in_binary_list(ca_in: &BinaryChunked, other: &Series) -> PolarsResult<Bool
         })
     } else {
         polars_ensure!(ca_in.len() == other.len(), ComputeError: "shapes don't match: expected {} elements in 'is_in' comparison, got {}", ca_in.len(), other.len());
-        // SAFETY: unstable series never lives longer than the iterator.
-        unsafe {
+        {
             ca_in
                 .iter()
                 .zip(other.list()?.amortized_iter())
@@ -271,7 +301,7 @@ fn is_in_binary_list(ca_in: &BinaryChunked, other: &Series) -> PolarsResult<Bool
                 .collect_trusted()
         }
     };
-    ca.rename(ca_in.name());
+    ca.rename(ca_in.name().clone());
     Ok(ca)
 }
 
@@ -302,25 +332,33 @@ fn is_in_binary_array(ca_in: &BinaryChunked, other: &Series) -> PolarsResult<Boo
             })
             .collect_trusted()
     };
-    ca.rename(ca_in.name());
+    ca.rename(ca_in.name().clone());
     Ok(ca)
 }
 
-fn is_in_binary(ca_in: &BinaryChunked, other: &Series) -> PolarsResult<BooleanChunked> {
+fn is_in_binary(
+    ca_in: &BinaryChunked,
+    other: &Series,
+    nulls_equal: bool,
+) -> PolarsResult<BooleanChunked> {
     match other.dtype() {
         DataType::List(dt) if DataType::Binary == **dt => is_in_binary_list(ca_in, other),
         #[cfg(feature = "dtype-array")]
         DataType::Array(dt, _) if DataType::Binary == **dt => is_in_binary_array(ca_in, other),
-        DataType::Binary => is_in_helper(ca_in, other),
+        DataType::Binary => is_in_helper(ca_in, other, nulls_equal),
         _ => polars_bail!(opq = is_in, ca_in.dtype(), other.dtype()),
     }
 }
 
-fn is_in_boolean_list(ca_in: &BooleanChunked, other: &Series) -> PolarsResult<BooleanChunked> {
+fn is_in_boolean_list(
+    ca_in: &BooleanChunked,
+    other: &Series,
+    _nulls_equal: bool, // NOTE: this is unimplemented at the moment.
+                        // See https://github.com/pola-rs/polars/issues/21485.
+) -> PolarsResult<BooleanChunked> {
     let mut ca: BooleanChunked = if ca_in.len() == 1 && other.len() != 1 {
         let value = ca_in.get(0);
         // SAFETY: we know the iterators len
-        // SAFETY: unstable series never lives longer than the iterator.
         unsafe {
             other
                 .list()?
@@ -336,8 +374,7 @@ fn is_in_boolean_list(ca_in: &BooleanChunked, other: &Series) -> PolarsResult<Bo
         }
     } else {
         polars_ensure!(ca_in.len() == other.len(), ComputeError: "shapes don't match: expected {} elements in 'is_in' comparison, got {}", ca_in.len(), other.len());
-        // SAFETY: unstable series never lives longer than the iterator.
-        unsafe {
+        {
             ca_in
                 .iter()
                 .zip(other.list()?.amortized_iter())
@@ -351,12 +388,17 @@ fn is_in_boolean_list(ca_in: &BooleanChunked, other: &Series) -> PolarsResult<Bo
                 .collect_trusted()
         }
     };
-    ca.rename(ca_in.name());
+    ca.rename(ca_in.name().clone());
     Ok(ca)
 }
 
 #[cfg(feature = "dtype-array")]
-fn is_in_boolean_array(ca_in: &BooleanChunked, other: &Series) -> PolarsResult<BooleanChunked> {
+fn is_in_boolean_array(
+    ca_in: &BooleanChunked,
+    other: &Series,
+    _nulls_equal: bool, // NOTE: this is unimplemented at the moment.
+                        // https://github.com/pola-rs/polars/issues/21485
+) -> PolarsResult<BooleanChunked> {
     let mut ca: BooleanChunked = if ca_in.len() == 1 && other.len() != 1 {
         let value = ca_in.get(0);
         // SAFETY: we know the iterators len
@@ -387,15 +429,23 @@ fn is_in_boolean_array(ca_in: &BooleanChunked, other: &Series) -> PolarsResult<B
             })
             .collect_trusted()
     };
-    ca.rename(ca_in.name());
+    ca.rename(ca_in.name().clone());
     Ok(ca)
 }
 
-fn is_in_boolean(ca_in: &BooleanChunked, other: &Series) -> PolarsResult<BooleanChunked> {
+fn is_in_boolean(
+    ca_in: &BooleanChunked,
+    other: &Series,
+    nulls_equal: bool,
+) -> PolarsResult<BooleanChunked> {
     match other.dtype() {
-        DataType::List(dt) if ca_in.dtype() == &**dt => is_in_boolean_list(ca_in, other),
+        DataType::List(dt) if ca_in.dtype() == &**dt => {
+            is_in_boolean_list(ca_in, other, nulls_equal)
+        },
         #[cfg(feature = "dtype-array")]
-        DataType::Array(dt, _) if ca_in.dtype() == &**dt => is_in_boolean_array(ca_in, other),
+        DataType::Array(dt, _) if ca_in.dtype() == &**dt => {
+            is_in_boolean_array(ca_in, other, nulls_equal)
+        },
         DataType::Boolean => {
             let other = other.bool().unwrap();
             let has_true = other.any();
@@ -406,9 +456,20 @@ fn is_in_boolean(ca_in: &BooleanChunked, other: &Series) -> PolarsResult<Boolean
             } else {
                 (other.sum().unwrap() as usize + nc) != other.len()
             };
-            Ok(ca_in
-                .apply_values(|v| if v { has_true } else { has_false })
-                .with_name(ca_in.name()))
+            let value_map = |v| if v { has_true } else { has_false };
+            if nulls_equal {
+                if other.has_nulls() {
+                    // If the rhs has nulls, then nulls in the left set evaluates to true.
+                    Ok(ca_in.apply(|opt_v| Some(opt_v.is_none_or(value_map))))
+                } else {
+                    // The rhs has no nulls; nulls in the left evaluates to false.
+                    Ok(ca_in.apply(|opt_v| Some(opt_v.is_some_and(value_map))))
+                }
+            } else {
+                Ok(ca_in
+                    .apply_values(value_map)
+                    .with_name(ca_in.name().clone()))
+            }
         },
         _ => polars_bail!(opq = is_in, ca_in.dtype(), other.dtype()),
     }
@@ -417,98 +478,121 @@ fn is_in_boolean(ca_in: &BooleanChunked, other: &Series) -> PolarsResult<Boolean
 #[cfg(feature = "dtype-struct")]
 fn is_in_struct_list(ca_in: &StructChunked, other: &Series) -> PolarsResult<BooleanChunked> {
     let mut ca: BooleanChunked = if ca_in.len() == 1 && other.len() != 1 {
-        let mut value = vec![];
-        let left = ca_in.clone().into_series();
-        let av = left.get(0).unwrap();
-        if let AnyValue::Struct(_, _, _) = av {
-            av._materialize_struct_av(&mut value);
-        }
+        let left = ca_in.get_row_encoded(Default::default())?;
+        let value = left.get(0).unwrap();
         other.list()?.apply_amortized_generic(|opt_s| {
             Some(
                 opt_s.map(|s| {
                     let ca = s.as_ref().struct_().unwrap();
-                    ca.iter().any(|a| a == value)
+                    let arr = ca.get_row_encoded_array(Default::default()).unwrap();
+                    arr.values_iter().any(|a| a == value)
                 }) == Some(true),
             )
         })
     } else {
         polars_ensure!(ca_in.len() == other.len(), ComputeError: "shapes don't match: expected {} elements in 'is_in' comparison, got {}", ca_in.len(), other.len());
-        // SAFETY: unstable series never lives longer than the iterator.
-        unsafe {
-            ca_in
-                .iter()
+
+        // TODO! improve this.
+        let ca = if ca_in.null_count() > 0 {
+            let ca_in = ca_in.rechunk();
+            let mut ca = ca_in.get_row_encoded(Default::default())?;
+            ca.merge_validities(ca_in.chunks());
+            ca
+        } else {
+            ca_in.get_row_encoded(Default::default())?
+        };
+        {
+            ca.iter()
                 .zip(other.list()?.amortized_iter())
                 .map(|(value, series)| match (value, series) {
                     (val, Some(series)) => {
+                        let val = val.expect("no_nulls");
                         let ca = series.as_ref().struct_().unwrap();
-                        ca.iter().any(|a| a == val)
+                        let arr = ca.get_row_encoded_array(Default::default()).unwrap();
+                        arr.values_iter().any(|a| a == val)
                     },
                     _ => false,
                 })
                 .collect()
         }
     };
-    ca.rename(ca_in.name());
+    ca.rename(ca_in.name().clone());
     Ok(ca)
 }
 
 #[cfg(all(feature = "dtype-struct", feature = "dtype-array"))]
 fn is_in_struct_array(ca_in: &StructChunked, other: &Series) -> PolarsResult<BooleanChunked> {
     let mut ca: BooleanChunked = if ca_in.len() == 1 && other.len() != 1 {
-        let mut value = vec![];
-        let left = ca_in.clone().into_series();
-        let av = left.get(0).unwrap();
-        if let AnyValue::Struct(_, _, _) = av {
-            av._materialize_struct_av(&mut value);
-        }
+        let left = ca_in.get_row_encoded(Default::default())?;
+        let value = left.get(0).unwrap();
         other.array()?.apply_amortized_generic(|opt_s| {
             Some(
                 opt_s.map(|s| {
                     let ca = s.as_ref().struct_().unwrap();
-                    ca.iter().any(|a| a == value)
+                    let arr = ca.get_row_encoded_array(Default::default()).unwrap();
+                    arr.values_iter().any(|a| a == value)
                 }) == Some(true),
             )
         })
     } else {
         polars_ensure!(ca_in.len() == other.len(), ComputeError: "shapes don't match: expected {} elements in 'is_in' comparison, got {}", ca_in.len(), other.len());
-        ca_in
-            .iter()
-            .zip(other.array()?.amortized_iter())
-            .map(|(value, series)| match (value, series) {
-                (val, Some(series)) => {
-                    let ca = series.as_ref().struct_().unwrap();
-                    ca.iter().any(|a| a == val)
-                },
-                _ => false,
-            })
-            .collect()
+
+        // TODO! improve this.
+        let ca = if ca_in.null_count() > 0 {
+            let ca_in = ca_in.rechunk();
+            let mut ca = ca_in.get_row_encoded(Default::default())?;
+            ca.merge_validities(ca_in.chunks());
+            ca
+        } else {
+            ca_in.get_row_encoded(Default::default())?
+        };
+        {
+            ca.iter()
+                .zip(other.array()?.amortized_iter())
+                .map(|(value, series)| match (value, series) {
+                    (val, Some(series)) => {
+                        let val = val.expect("no nulls");
+                        let ca = series.as_ref().struct_().unwrap();
+                        let arr = ca.get_row_encoded_array(Default::default()).unwrap();
+                        arr.values_iter().any(|a| a == val)
+                    },
+                    _ => false,
+                })
+                .collect()
+        }
     };
-    ca.rename(ca_in.name());
+    ca.rename(ca_in.name().clone());
     Ok(ca)
 }
 
 #[cfg(feature = "dtype-struct")]
-fn is_in_struct(ca_in: &StructChunked, other: &Series) -> PolarsResult<BooleanChunked> {
+fn is_in_struct(
+    ca_in: &StructChunked,
+    other: &Series,
+    nulls_equal: bool,
+) -> PolarsResult<BooleanChunked> {
     match other.dtype() {
         DataType::List(_) => is_in_struct_list(ca_in, other),
         #[cfg(feature = "dtype-array")]
         DataType::Array(_, _) => is_in_struct_array(ca_in, other),
         _ => {
+            let ca_in = ca_in.cast(&ca_in.dtype().to_physical()).unwrap();
+            let ca_in = ca_in.struct_()?;
             let other = other.cast(&other.dtype().to_physical()).unwrap();
             let other = other.struct_()?;
 
             polars_ensure!(
-                ca_in.fields().len() == other.fields().len(),
+                ca_in.struct_fields().len() == other.struct_fields().len(),
                 ComputeError: "`is_in`: mismatch in the number of struct fields: {} and {}",
-                ca_in.fields().len(), other.fields().len()
+                ca_in.struct_fields().len(), other.struct_fields().len()
             );
 
             // first make sure that the types are equal
-            let ca_in_dtypes: Vec<_> = ca_in.fields().iter().map(|f| f.dtype()).collect();
-            let other_dtypes: Vec<_> = other.fields().iter().map(|f| f.dtype()).collect();
+            let ca_in_dtypes: Vec<_> = ca_in.struct_fields().iter().map(|f| f.dtype()).collect();
+            let other_dtypes: Vec<_> = other.struct_fields().iter().map(|f| f.dtype()).collect();
             if ca_in_dtypes != other_dtypes {
-                let ca_in_names = ca_in.fields().iter().map(|f| f.name());
-                let other_names = other.fields().iter().map(|f| f.name());
+                let ca_in_names = ca_in.struct_fields().iter().map(|f| f.name().clone());
+                let other_names = other.struct_fields().iter().map(|f| f.name().clone());
                 let supertypes = ca_in_dtypes
                     .iter()
                     .zip(other_dtypes.iter())
@@ -524,40 +608,22 @@ fn is_in_struct(ca_in: &StructChunked, other: &Series) -> PolarsResult<BooleanCh
                     .map(|(name, st)| Field::new(name, st.clone()))
                     .collect();
                 let other_super = other.cast(&DataType::Struct(other_supertype_fields))?;
-                return is_in(&ca_in_super, &other_super);
+                return is_in(&ca_in_super, &other_super, nulls_equal);
             }
 
-            let mut any_values = Vec::with_capacity(other.len() * other.fields().len());
-            // SAFETY:
-            // the iterator is unsafe as the lifetime is tied to the iterator
-            // so we copy to an owned buffer first
-            other.iter().for_each(|vals| {
-                any_values.extend_from_slice(vals);
-            });
-
-            // then we fill the set
-            let mut set = PlHashSet::with_capacity(other.len());
-            for key in any_values.chunks_exact(other.fields().len()) {
-                set.insert(key);
+            if ca_in.null_count() > 0 {
+                let ca_in = ca_in.rechunk();
+                let mut ca_in_o = ca_in.get_row_encoded(Default::default())?;
+                ca_in_o.merge_validities(ca_in.chunks());
+                let other = other.rechunk();
+                let mut ca_other = other.get_row_encoded(Default::default())?;
+                ca_other.merge_validities(other.chunks());
+                is_in_helper_ca(&ca_in_o, &ca_other, nulls_equal)
+            } else {
+                let ca_in = ca_in.get_row_encoded(Default::default())?;
+                let ca_other = other.get_row_encoded(Default::default())?;
+                is_in_helper_ca(&ca_in, &ca_other, nulls_equal)
             }
-            // physical ca_in
-            let ca_in_ca = ca_in.cast(&ca_in.dtype().to_physical()).unwrap();
-            let ca_in_ca = ca_in_ca.struct_().unwrap();
-
-            // and then we check for membership
-            let mut ca: BooleanChunked = ca_in_ca
-                .iter()
-                .map(|vals| {
-                    // If all rows are null we see the struct row as missing.
-                    if !vals.iter().all(|val| matches!(val, AnyValue::Null)) {
-                        Some(set.contains(&vals))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            ca.rename(ca_in.name());
-            Ok(ca)
         },
     }
 }
@@ -566,10 +632,14 @@ fn is_in_struct(ca_in: &StructChunked, other: &Series) -> PolarsResult<BooleanCh
 fn is_in_string_categorical(
     ca_in: &StringChunked,
     other: &CategoricalChunked,
+    nulls_equal: bool,
 ) -> PolarsResult<BooleanChunked> {
     // In case of fast unique, we can directly use the categories. Otherwise we need to
     // first get the unique physicals
-    let categories = StringChunked::with_chunk("", other.get_rev_map().get_categories().clone());
+    let categories = StringChunked::with_chunk(
+        PlSmallStr::EMPTY,
+        other.get_rev_map().get_categories().clone(),
+    );
     let other = if other._can_fast_unique() {
         categories
     } else {
@@ -577,16 +647,20 @@ fn is_in_string_categorical(
         // SAFETY: Invariant of categorical means indices are in bound
         unsafe { categories.take_unchecked(s.idx()?) }
     };
-    is_in_helper_ca(&ca_in.as_binary(), &other.as_binary())
+    is_in_helper_ca(&ca_in.as_binary(), &other.as_binary(), nulls_equal)
 }
 
 #[cfg(feature = "dtype-categorical")]
-fn is_in_cat(ca_in: &CategoricalChunked, other: &Series) -> PolarsResult<BooleanChunked> {
+fn is_in_cat(
+    ca_in: &CategoricalChunked,
+    other: &Series,
+    nulls_equal: bool,
+) -> PolarsResult<BooleanChunked> {
     match other.dtype() {
         DataType::Categorical(_, _) | DataType::Enum(_, _) => {
             let (ca_in, other_in) =
                 make_categoricals_compatible(ca_in, other.categorical().unwrap())?;
-            is_in_helper_ca(ca_in.physical(), other_in.physical())
+            is_in_helper_ca(ca_in.physical(), other_in.physical(), nulls_equal)
         },
         DataType::String => {
             let ca_other = other.str().unwrap();
@@ -621,10 +695,25 @@ fn is_in_cat(ca_in: &CategoricalChunked, other: &Series) -> PolarsResult<Boolean
                 },
             }
 
-            Ok(ca_in
-                .physical()
-                .apply_values_generic(|val| set.contains(&val.to_total_ord()))
-                .with_name(ca_in.name()))
+            let ca = ca_in.physical();
+            if nulls_equal {
+                if other.has_nulls() {
+                    // If the rhs has nulls, then nulls in the left set evaluates to true.
+                    Ok(unary_elementwise(ca, |val| {
+                        val.is_none_or(|v| set.contains(&v.to_total_ord()))
+                    }))
+                } else {
+                    // The rhs has no nulls; nulls in the left evaluates to false.
+                    Ok(unary_elementwise(ca, |val| {
+                        val.is_some_and(|v| set.contains(&v.to_total_ord()))
+                    }))
+                }
+            } else {
+                Ok(
+                    unary_elementwise_values(ca, |val| set.contains(&val.to_total_ord()))
+                        .with_name(ca.name().clone()),
+                )
+            }
         },
 
         DataType::List(dt)
@@ -671,8 +760,7 @@ fn is_in_cat_list(ca_in: &CategoricalChunked, other: &Series) -> PolarsResult<Bo
         // Make physicals compatible of ca_in with those of the list
         let (_, ca_in) = make_categoricals_compatible(inner_cat, ca_in)?;
 
-        // SAFETY: unstable series never lives longer than the iterator.
-        unsafe {
+        {
             ca_in
                 .physical()
                 .iter()
@@ -687,45 +775,77 @@ fn is_in_cat_list(ca_in: &CategoricalChunked, other: &Series) -> PolarsResult<Bo
                 .collect_trusted()
         }
     };
-    ca.rename(ca_in.name());
+    ca.rename(ca_in.name().clone());
     Ok(ca)
 }
 
-pub fn is_in(s: &Series, other: &Series) -> PolarsResult<BooleanChunked> {
+fn is_in_null(s: &Series, other: &Series, nulls_equal: bool) -> PolarsResult<BooleanChunked> {
+    if nulls_equal {
+        let ca_in = s.null()?;
+        Ok(match other.dtype() {
+            DataType::List(_) => other.list()?.apply_amortized_generic(|opt_s| {
+                Some(opt_s.map(|s| s.as_ref().has_nulls()) == Some(true))
+            }),
+            #[cfg(feature = "dtype-array")]
+            DataType::Array(_, _) => other.array()?.apply_amortized_generic(|opt_s| {
+                Some(opt_s.map(|s| s.as_ref().has_nulls()) == Some(true))
+            }),
+            _ => {
+                // If other has null values, then all are true, else all are false.
+                BooleanChunked::from_iter_values(
+                    ca_in.name().clone(),
+                    std::iter::repeat_n(other.has_nulls(), ca_in.len()),
+                )
+            },
+        })
+    } else {
+        let out = s.cast(&DataType::Boolean)?;
+        let ca_bool = out.bool()?.clone();
+        Ok(ca_bool)
+    }
+}
+
+pub fn is_in(s: &Series, other: &Series, nulls_equal: bool) -> PolarsResult<BooleanChunked> {
     match s.dtype() {
         #[cfg(feature = "dtype-categorical")]
         DataType::Categorical(_, _) | DataType::Enum(_, _) => {
             let ca = s.categorical().unwrap();
-            is_in_cat(ca, other)
+            is_in_cat(ca, other, nulls_equal)
         },
         #[cfg(feature = "dtype-struct")]
         DataType::Struct(_) => {
             let ca = s.struct_().unwrap();
-            is_in_struct(ca, other)
+            is_in_struct(ca, other, nulls_equal)
         },
         DataType::String => {
             let ca = s.str().unwrap();
-            is_in_string(ca, other)
+            is_in_string(ca, other, nulls_equal)
         },
         DataType::Binary => {
             let ca = s.binary().unwrap();
-            is_in_binary(ca, other)
+            is_in_binary(ca, other, nulls_equal)
         },
         DataType::Boolean => {
             let ca = s.bool().unwrap();
-            is_in_boolean(ca, other)
+            is_in_boolean(ca, other, nulls_equal)
         },
-        dt if dt.to_physical().is_numeric() => {
+        DataType::Null => is_in_null(s, other, nulls_equal),
+        #[cfg(feature = "dtype-decimal")]
+        DataType::Decimal(_, _) => {
+            let s = s.decimal()?;
+            let other = other.decimal()?;
+            let scale = s.scale().max(other.scale());
+            let s = s.to_scale(scale)?;
+            let other = other.to_scale(scale)?.into_owned().into_series();
+
+            is_in_numeric(s.physical(), other.to_physical_repr().as_ref(), nulls_equal)
+        },
+        dt if dt.to_physical().is_primitive_numeric() => {
             let s = s.to_physical_repr();
             with_match_physical_numeric_polars_type!(s.dtype(), |$T| {
                 let ca: &ChunkedArray<$T> = s.as_ref().as_ref().as_ref();
-                is_in_numeric(ca, other)
+                is_in_numeric(ca, other, nulls_equal)
             })
-        },
-        DataType::Null => {
-            let series_bool = s.cast(&DataType::Boolean)?;
-            let ca = series_bool.bool().unwrap();
-            Ok(ca.clone())
         },
         dt => polars_bail!(opq = is_in, dt),
     }

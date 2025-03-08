@@ -14,12 +14,12 @@ fn check_lengths(length_srs: usize, length_by: usize) -> PolarsResult<()> {
 }
 
 fn new_by(by: &IdxCa, len: usize) -> IdxCa {
-    IdxCa::new(
-        "",
-        std::iter::repeat(by.get(0).unwrap())
-            .take(len)
-            .collect::<Vec<IdxSize>>(),
-    )
+    if let Some(x) = by.get(0) {
+        let values = std::iter::repeat_n(x, len).collect::<Vec<IdxSize>>();
+        IdxCa::new(PlSmallStr::EMPTY, values)
+    } else {
+        IdxCa::full_null(PlSmallStr::EMPTY, len)
+    }
 }
 
 fn repeat_by_primitive<T>(ca: &ChunkedArray<T>, by: &IdxCa) -> PolarsResult<ListChunked>
@@ -32,14 +32,14 @@ where
         (left_len, right_len) if left_len == right_len => {
             Ok(arity::binary(ca, by, |arr, by| {
                 let iter = arr.into_iter().zip(by).map(|(opt_v, opt_by)| {
-                    opt_by.map(|by| std::iter::repeat(opt_v.copied()).take(*by as usize))
+                    opt_by.map(|by| std::iter::repeat_n(opt_v.copied(), *by as usize))
                 });
 
                 // SAFETY: length of iter is trusted.
                 unsafe {
                     LargeListArray::from_iter_primitive_trusted_len(
                         iter,
-                        T::get_dtype().to_arrow(true),
+                        T::get_dtype().to_arrow(CompatLevel::newest()),
                     )
                 }
             }))
@@ -64,7 +64,7 @@ fn repeat_by_bool(ca: &BooleanChunked, by: &IdxCa) -> PolarsResult<ListChunked> 
         (left_len, right_len) if left_len == right_len => {
             Ok(arity::binary(ca, by, |arr, by| {
                 let iter = arr.into_iter().zip(by).map(|(opt_v, opt_by)| {
-                    opt_by.map(|by| std::iter::repeat(opt_v).take(*by as usize))
+                    opt_by.map(|by| std::iter::repeat_n(opt_v, *by as usize))
                 });
 
                 // SAFETY: length of iter is trusted.
@@ -91,7 +91,7 @@ fn repeat_by_binary(ca: &BinaryChunked, by: &IdxCa) -> PolarsResult<ListChunked>
         (left_len, right_len) if left_len == right_len => {
             Ok(arity::binary(ca, by, |arr, by| {
                 let iter = arr.into_iter().zip(by).map(|(opt_v, opt_by)| {
-                    opt_by.map(|by| std::iter::repeat(opt_v).take(*by as usize))
+                    opt_by.map(|by| std::iter::repeat_n(opt_v, *by as usize))
                 });
 
                 // SAFETY: length of iter is trusted.
@@ -119,9 +119,10 @@ pub fn repeat_by(s: &Series, by: &IdxCa) -> PolarsResult<ListChunked> {
         String => {
             let ca = s_phys.str().unwrap();
             repeat_by_binary(&ca.as_binary(), by)
+                .and_then(|ca| ca.apply_to_inner(&|s| unsafe { s.cast_unchecked(&String) }))
         },
         Binary => repeat_by_binary(s_phys.binary().unwrap(), by),
-        dt if dt.is_numeric() => {
+        dt if dt.is_primitive_numeric() => {
             with_match_physical_numeric_polars_type!(dt, |$T| {
                 let ca: &ChunkedArray<$T> = s_phys.as_ref().as_ref().as_ref();
                 repeat_by_primitive(ca, by)
@@ -131,6 +132,6 @@ pub fn repeat_by(s: &Series, by: &IdxCa) -> PolarsResult<ListChunked> {
     };
     out.and_then(|ca| {
         let logical_type = s.dtype();
-        ca.apply_to_inner(&|s| unsafe { s.cast_unchecked(logical_type) })
+        ca.apply_to_inner(&|s| unsafe { s.from_physical_unchecked(logical_type) })
     })
 }
